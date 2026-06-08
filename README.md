@@ -118,3 +118,9 @@ These share the same on-disk index cache, so running `--once-claude` also warms 
 | `~/.cache/agenttop/anthropic-limits.json` | last fetched rate-limit headers (1h TTL) |
 
 Both are caches — safe to delete; agenttop regenerates them.
+
+---
+
+## License
+
+MIT — see [LICENSE](LICENSE).
