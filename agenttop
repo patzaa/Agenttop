@@ -1,0 +1,1628 @@
+#!/usr/bin/env python3
+"""agenttop — TUI for launchd jobs + Claude Code usage (htop-style).
+
+Two-pane vertical split:
+  Left  — launchd jobs from ~/Library/LaunchAgents, /Library/LaunchAgents,
+          /Library/LaunchDaemons.
+  Right — Claude Code usage from ~/.claude/projects/**/*.jsonl
+          5h rolling window, per-model + per-project breakdown, active
+          sessions, 7-day history. Per-session live tail.
+
+Auto-refreshes every 2s. Zero deps — Python stdlib (curses + json).
+
+Global keys:
+  q / Q     quit
+  Tab       cycle pane focus
+  r         force refresh
+
+Left pane (launchd) — keys active when focused:
+  / (slash) filter (Enter to apply, Esc to cancel)    c clear filter
+  j / ↓     down                                       k / ↑   up
+  g / G     top / bottom
+  Enter     follow log live (any key returns)
+  R         restart selected job (kickstart -k)
+  s         stop selected job (SIGTERM)
+
+Right pane (Claude) — keys active when focused:
+  j / ↓     down                                       k / ↑   up
+  Enter     tail selected session (live token stream)
+  v         cycle window: 5h → today → 7d → 5h
+"""
+
+import curses
+import getpass
+import json
+import os
+import pickle
+import re
+import subprocess
+import sys
+import threading
+import time
+from collections import defaultdict
+from datetime import datetime, timedelta
+from pathlib import Path
+
+WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
+
+LOCATIONS = [
+    Path.home() / "Library" / "LaunchAgents",
+    Path("/Library/LaunchAgents"),
+    Path("/Library/LaunchDaemons"),
+]
+
+CLAUDE_DIR = Path.home() / ".claude" / "projects"
+
+HIDE_LABEL_SUBSTRINGS = (
+    "adobe",
+    "grammarly",
+    "onedrive",
+)
+
+WINDOW_MODES = [("5h", 5 * 3600), ("today", "today"), ("7d", 7 * 86400)]
+
+CACHE_DIR = Path.home() / ".cache" / "agenttop"
+LIMITS_CACHE = CACHE_DIR / "anthropic-limits.json"
+LEGACY_CACHE = Path.home() / ".cache" / "launchd-top" / "anthropic-limits.json"
+LIMITS_TTL_SECONDS = 3600  # auto-refresh after 1h of staleness (≈1 msg/h while running)
+
+# Persistent event index — avoids re-parsing all of ~/.claude/projects (590MB+,
+# millions of lines) on every cold start. Parse once, reload in <1s thereafter.
+INDEX_CACHE = CACHE_DIR / "index-cache.pkl"
+INDEX_CACHE_VERSION = 1            # bump to invalidate cache on schema change
+EVENT_RETENTION_DAYS = 31         # drop events older than this; no view looks back further
+SAVE_INTERVAL_SECONDS = 120       # throttle on-disk index writes while running
+
+
+def fetch_anthropic_limits() -> dict:
+    """Fetch real anthropic-ratelimit-* headers by running a tiny `claude -p .` call.
+
+    The headers come from Anthropic's API response, parsed verbatim — no math
+    or estimation on this side. Each call costs one billable message, so callers
+    must rate-limit (this is the raw fetch; caching is in LimitsFetcher).
+    """
+    env = {**os.environ, "ANTHROPIC_LOG": "debug"}
+    try:
+        r = subprocess.run(
+            ["claude", "--no-session-persistence", "-p", "."],
+            capture_output=True, text=True, timeout=60, env=env,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+        return {"error": f"claude call failed: {e}", "ts": time.time()}
+
+    text = r.stdout + r.stderr
+    pat = re.compile(r'"(anthropic-ratelimit-[a-z0-9-]+)":\s*"([^"]+)"')
+    headers = {}
+    for k, v in pat.findall(text):
+        headers[k] = v
+
+    if not headers:
+        return {
+            "error": "no anthropic-ratelimit-* headers in response",
+            "ts": time.time(),
+        }
+
+    def gf(k):
+        try: return float(headers[k])
+        except (KeyError, ValueError): return None
+    def gi(k):
+        try: return int(headers[k])
+        except (KeyError, ValueError): return None
+
+    return {
+        "ts": time.time(),
+        "5h_util": gf("anthropic-ratelimit-unified-5h-utilization"),
+        "5h_reset": gi("anthropic-ratelimit-unified-5h-reset"),
+        "5h_status": headers.get("anthropic-ratelimit-unified-5h-status"),
+        "7d_util": gf("anthropic-ratelimit-unified-7d-utilization"),
+        "7d_reset": gi("anthropic-ratelimit-unified-7d-reset"),
+        "7d_status": headers.get("anthropic-ratelimit-unified-7d-status"),
+        "status": headers.get("anthropic-ratelimit-unified-status"),
+        "representative": headers.get("anthropic-ratelimit-unified-representative-claim"),
+    }
+
+
+class LimitsFetcher:
+    """Caches Anthropic rate-limit headers; refreshes async on demand.
+
+    State lives in ~/.cache/launchd-top/anthropic-limits.json so cache survives
+    restarts. Background thread fetches; main loop reads `data` cheaply.
+    """
+
+    def __init__(self):
+        self.data: dict = {}
+        self.fetching: bool = False
+        self.lock = threading.Lock()
+        self._load_cache()
+
+    def _load_cache(self):
+        for path in (LIMITS_CACHE, LEGACY_CACHE):
+            try:
+                self.data = json.loads(path.read_text())
+                return
+            except (OSError, json.JSONDecodeError):
+                continue
+        self.data = {}
+
+    def age_seconds(self) -> float:
+        ts = (self.data or {}).get("ts", 0)
+        return max(0, time.time() - ts) if ts else float("inf")
+
+    def is_stale(self, ttl: int = LIMITS_TTL_SECONDS) -> bool:
+        if not self.data or "error" in self.data:
+            return True
+        return self.age_seconds() > ttl
+
+    def fetch_async(self):
+        with self.lock:
+            if self.fetching:
+                return
+            self.fetching = True
+        t = threading.Thread(target=self._fetch_blocking, daemon=True)
+        t.start()
+
+    def _fetch_blocking(self):
+        try:
+            result = fetch_anthropic_limits()
+            with self.lock:
+                self.data = result
+            try:
+                LIMITS_CACHE.parent.mkdir(parents=True, exist_ok=True)
+                LIMITS_CACHE.write_text(json.dumps(result))
+            except OSError:
+                pass
+        finally:
+            with self.lock:
+                self.fetching = False
+
+# ── launchd data layer ──────────────────────────────────────────────
+
+
+def parse_plist(path: Path):
+    r = subprocess.run(
+        ["plutil", "-convert", "json", "-o", "-", str(path)],
+        capture_output=True, text=True,
+    )
+    if r.returncode != 0:
+        return None
+    try:
+        return json.loads(r.stdout)
+    except json.JSONDecodeError:
+        return None
+
+
+def schedule_str(plist: dict) -> str:
+    if "StartCalendarInterval" in plist:
+        sci = plist["StartCalendarInterval"]
+        if isinstance(sci, dict):
+            sci = [sci]
+        parts = []
+        for d in sci:
+            day = WEEKDAYS[d["Weekday"] % 7] if "Weekday" in d else "*"
+            hour = d.get("Hour")
+            mn = d.get("Minute", 0)
+            time = f"{hour:02d}:{mn:02d}" if hour is not None else "*"
+            parts.append(f"{day} {time}")
+        if len(parts) > 1:
+            times = {p.split(" ", 1)[1] for p in parts}
+            if len(times) == 1:
+                days = ",".join(p.split(" ", 1)[0] for p in parts)
+                return f"{days} {times.pop()}"
+        return ", ".join(parts)
+    if "StartInterval" in plist:
+        s = plist["StartInterval"]
+        for unit, n in (("d", 86400), ("h", 3600), ("m", 60)):
+            if s >= n and s % n == 0:
+                return f"every {s // n}{unit}"
+        return f"every {s}s"
+    if plist.get("KeepAlive"):
+        return "keep-alive"
+    if plist.get("RunAtLoad"):
+        return "at load"
+    if "WatchPaths" in plist:
+        return "on path change"
+    return "-"
+
+
+def status_map() -> dict:
+    r = subprocess.run(["launchctl", "list"], capture_output=True, text=True)
+    s = {}
+    for line in r.stdout.splitlines()[1:]:
+        parts = line.split(None, 2)
+        if len(parts) == 3:
+            pid, code, label = parts
+            s[label] = (pid, code)
+    return s
+
+
+def human_size(n):
+    if n is None:
+        return "-"
+    if n < 1024:
+        return f"{n}B"
+    if n < 1024 * 1024:
+        return f"{n // 1024}K"
+    if n < 1024 ** 3:
+        return f"{n / (1024 ** 2):.1f}M"
+    return f"{n / (1024 ** 3):.1f}G"
+
+
+def log_size(plist: dict):
+    path = plist.get("StandardOutPath") or plist.get("StandardErrorPath")
+    if not path:
+        return None
+    try:
+        return os.path.getsize(os.path.expanduser(path))
+    except OSError:
+        return None
+
+
+def derive_status(pid: str, exit_code: str):
+    """Returns (icon, color_pair, status_text)."""
+    is_running = pid not in ("-", "0", "")
+    has_error = exit_code not in ("-", "0", "")
+    if is_running and has_error:
+        return "⚠", 3, f"exit {exit_code}"
+    if is_running:
+        return "●", 1, "ok"
+    if has_error:
+        return "✗", 2, f"exit {exit_code}"
+    if exit_code == "-":
+        return "○", 4, "never run"
+    return "○", 4, "idle"
+
+
+def collect_jobs():
+    statuses = status_map()
+    jobs = []
+    for loc in LOCATIONS:
+        if not loc.exists():
+            continue
+        try:
+            entries = sorted(loc.glob("*.plist"))
+        except PermissionError:
+            continue
+        is_daemon = loc == Path("/Library/LaunchDaemons")
+        for p in entries:
+            plist = parse_plist(p)
+            if plist is None:
+                continue
+            label = plist.get("Label", p.stem)
+            label_lc = label.lower()
+            if any(sub in label_lc for sub in HIDE_LABEL_SUBSTRINGS):
+                continue
+            pid, code = statuses.get(label, ("-", "-"))
+            icon, color, status_text = derive_status(pid, code)
+            jobs.append({
+                "label": label,
+                "schedule": schedule_str(plist),
+                "pid": pid,
+                "exit": code,
+                "status_text": status_text,
+                "log_size": log_size(plist),
+                "icon": icon,
+                "color": color,
+                "log_path": plist.get("StandardOutPath") or plist.get("StandardErrorPath"),
+                "stderr_path": plist.get("StandardErrorPath"),
+                "location": loc.name,
+                "is_daemon": is_daemon,
+            })
+    return jobs
+
+
+# ── launchd actions ─────────────────────────────────────────────────
+
+
+def domain_for(job):
+    """`gui/<uid>/<label>` for user/system agents, `system/<label>` for daemons."""
+    if job["is_daemon"]:
+        return f"system/{job['label']}"
+    return f"gui/{os.getuid()}/{job['label']}"
+
+
+def restart_job(job):
+    target = domain_for(job)
+    r = subprocess.run(
+        ["launchctl", "kickstart", "-k", target],
+        capture_output=True, text=True,
+    )
+    if r.returncode == 0:
+        return f"Restarted {job['label']}"
+    err = (r.stderr or r.stdout).strip().splitlines()[-1] if (r.stderr or r.stdout) else "unknown error"
+    if job["is_daemon"]:
+        err += "  (system daemons need: sudo launchctl kickstart -k " + target + ")"
+    return f"Restart failed: {err}"
+
+
+def stop_job(job):
+    target = domain_for(job)
+    r = subprocess.run(
+        ["launchctl", "kill", "SIGTERM", target],
+        capture_output=True, text=True,
+    )
+    if r.returncode == 0:
+        return f"Sent SIGTERM to {job['label']}"
+    err = (r.stderr or r.stdout).strip().splitlines()[-1] if (r.stderr or r.stdout) else "unknown error"
+    return f"Stop failed: {err}"
+
+
+# ── Claude data layer ───────────────────────────────────────────────
+
+
+def _iso_to_epoch(s: str) -> float:
+    """Parse ISO-8601 to UNIX epoch. Accepts trailing Z or +00:00."""
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    return datetime.fromisoformat(s).timestamp()
+
+
+def _short_model(model: str) -> str:
+    """claude-opus-4-7 → opus-4.7, claude-sonnet-4-6 → sonnet-4.6."""
+    if not model:
+        return "?"
+    m = model
+    if m.startswith("claude-"):
+        m = m[len("claude-"):]
+    # claude-haiku-4-5-20251001 → haiku-4-5 (drop date suffix)
+    parts = m.split("-")
+    keep = []
+    for p in parts:
+        # Drop date-shaped tokens (8 digits)
+        if p.isdigit() and len(p) == 8:
+            break
+        keep.append(p)
+    out = "-".join(keep)
+    # opus-4-7 → opus-4.7 (more compact + readable)
+    if len(keep) >= 3 and keep[-1].isdigit() and keep[-2].isdigit():
+        out = "-".join(keep[:-2]) + "-" + keep[-2] + "." + keep[-1]
+    return out
+
+
+def _project_name_from_dir(d: Path) -> str:
+    """Best-effort: read a cwd from any event in this dir; else last segment of dir name."""
+    try:
+        for jsonl in sorted(d.glob("*.jsonl")):
+            try:
+                with open(jsonl, "rb") as f:
+                    for raw in f:
+                        try:
+                            ev = json.loads(raw)
+                        except (json.JSONDecodeError, ValueError):
+                            continue
+                        cwd = ev.get("cwd")
+                        if cwd:
+                            base = os.path.basename(cwd)
+                            if base:
+                                return base
+                    break  # only inspect first file
+            except OSError:
+                continue
+    except OSError:
+        pass
+    name = d.name.lstrip("-")
+    parts = name.split("-")
+    return parts[-1] if parts else name or "?"
+
+
+def _fmt_tokens(n: int) -> str:
+    if n is None:
+        return "-"
+    if n < 1000:
+        return str(n)
+    if n < 1_000_000:
+        return f"{n / 1000:.1f}K".replace(".0K", "K")
+    if n < 1_000_000_000:
+        return f"{n / 1_000_000:.1f}M".replace(".0M", "M")
+    return f"{n / 1_000_000_000:.1f}G"
+
+
+def _fmt_relative(ts: float, now: float) -> str:
+    delta = max(0, int(now - ts))
+    if delta < 60:
+        return f"{delta}s ago"
+    if delta < 3600:
+        return f"{delta // 60}m ago"
+    if delta < 86400:
+        return f"{delta // 3600}h ago"
+    return f"{delta // 86400}d ago"
+
+
+def _fmt_duration(minutes: float) -> str:
+    if minutes <= 0:
+        return "now"
+    if minutes >= 1440:
+        return f"{int(minutes / 1440)}d"
+    if minutes >= 60:
+        h, m = divmod(int(minutes), 60)
+        return f"{h}h {m}m" if m else f"{h}h"
+    return f"{int(minutes)}m"
+
+
+def _short_branch(b: str, max_len: int = 22) -> str:
+    if not b:
+        return ""
+    if len(b) <= max_len:
+        return b
+    return b[: max_len - 1] + "…"
+
+
+def _sparkline(values, max_val=None) -> str:
+    """One-row sparkline using Unicode block heights (▁▂▃▄▅▆▇█)."""
+    if not values:
+        return ""
+    blocks = " ▁▂▃▄▅▆▇█"
+    m = max_val if max_val is not None else max(values)
+    if not m:
+        return blocks[0] * len(values)
+    chars = []
+    for v in values:
+        idx = max(0, min(len(blocks) - 1, int((v / m) * (len(blocks) - 1))))
+        chars.append(blocks[idx])
+    return "".join(chars)
+
+
+def _bar(frac: float, width: int) -> str:
+    """Unicode block bar — full + partial blocks."""
+    if width <= 0:
+        return ""
+    frac = max(0.0, min(1.0, frac))
+    blocks = " ▏▎▍▌▋▊▉█"
+    units = frac * width
+    full = int(units)
+    rem = units - full
+    partial = blocks[int(rem * (len(blocks) - 1))]
+    s = "█" * full + (partial if full < width else "")
+    return s.ljust(width, "·")
+
+
+class ClaudeIndex:
+    """Incremental scan of ~/.claude/projects/**/*.jsonl.
+
+    On refresh(): re-stats every file, only reads newly-appended bytes.
+    Events stay in memory as flat tuples — small (~64 bytes each), so 100k+
+    events fit easily.
+    """
+
+    # Event tuple positions
+    TS, PROJECT, SID, MODEL, IN, OUT, CC, CR = range(8)
+
+    def __init__(self, root: Path = None):
+        self.root = root or CLAUDE_DIR
+        self.files: dict = {}     # path -> {pos, project}
+        self.events: list = []    # (ts, project, sid, model, in, out, cc, cr)
+        self.project_names: dict = {}  # project_dir -> display name
+        # Per-session side data (latest seen). Updated as new events parse.
+        self.session_meta: dict = {}   # sid -> {branch, cwd, project, model, last_ts}
+        self.errors: int = 0      # count of malformed lines
+        self._load_index()
+
+    def _load_index(self):
+        """Restore the parsed index from disk, if present and current.
+
+        On success, refresh() resumes from each file's saved byte offset and
+        only reads appended data — a cold start drops from ~minutes to <1s.
+        Any error (missing/corrupt cache, version bump) silently falls back to
+        an empty index, forcing a one-time full rescan.
+        """
+        try:
+            with open(INDEX_CACHE, "rb") as f:
+                blob = pickle.load(f)
+        except (OSError, pickle.UnpicklingError, EOFError, ValueError):
+            return
+        if not isinstance(blob, dict) or blob.get("version") != INDEX_CACHE_VERSION:
+            return
+        try:
+            self.files = {Path(k): v for k, v in blob["files"].items()}
+            self.events = blob["events"]
+            self.project_names = {Path(k): v for k, v in blob["project_names"].items()}
+            self.session_meta = blob["session_meta"]
+            self.errors = blob.get("errors", 0)
+        except (KeyError, TypeError, AttributeError):
+            self.files, self.events = {}, []
+            self.project_names, self.session_meta, self.errors = {}, {}, 0
+
+    def prune(self, now: float = None, days: int = EVENT_RETENTION_DAYS):
+        """Drop in-memory events older than the retention window.
+
+        File offsets are left untouched, so pruned-away history is never
+        re-read — it's simply outside every view's lookback. Keeps both memory
+        and the on-disk cache bounded as history grows.
+        """
+        now = now if now is not None else time.time()
+        cutoff = now - days * 86400
+        if self.events:
+            self.events = [e for e in self.events if e[self.TS] >= cutoff]
+
+    def save(self):
+        """Atomically persist the index (prunes first to bound size)."""
+        self.prune()
+        try:
+            CACHE_DIR.mkdir(parents=True, exist_ok=True)
+            blob = {
+                "version": INDEX_CACHE_VERSION,
+                "files": {str(k): v for k, v in self.files.items()},
+                "events": self.events,
+                "project_names": {str(k): v for k, v in self.project_names.items()},
+                "session_meta": self.session_meta,
+                "errors": self.errors,
+            }
+            tmp = INDEX_CACHE.parent / (INDEX_CACHE.name + ".tmp")
+            with open(tmp, "wb") as f:
+                pickle.dump(blob, f, protocol=5)
+            os.replace(tmp, INDEX_CACHE)
+        except (OSError, pickle.PicklingError):
+            pass
+
+    def _project_name(self, project_dir: Path) -> str:
+        if project_dir not in self.project_names:
+            self.project_names[project_dir] = _project_name_from_dir(project_dir)
+        return self.project_names[project_dir]
+
+    def refresh(self) -> int:
+        """Returns number of new events added."""
+        if not self.root.exists():
+            return 0
+        try:
+            project_dirs = [p for p in self.root.iterdir() if p.is_dir()]
+        except OSError:
+            return 0
+        added = 0
+        for pdir in project_dirs:
+            project = self._project_name(pdir)
+            try:
+                jsonls = list(pdir.glob("*.jsonl"))
+            except OSError:
+                continue
+            for jpath in jsonls:
+                try:
+                    st = jpath.stat()
+                except OSError:
+                    continue
+                meta = self.files.get(jpath)
+                if meta is None:
+                    self.files[jpath] = {"pos": 0, "project": project}
+                    meta = self.files[jpath]
+                if st.st_size < meta["pos"]:
+                    # truncation/rotation — restart this file
+                    meta["pos"] = 0
+                if st.st_size > meta["pos"]:
+                    added += self._read_from(jpath, meta, project)
+        return added
+
+    def _read_from(self, jpath: Path, meta: dict, project: str) -> int:
+        try:
+            with open(jpath, "rb") as f:
+                f.seek(meta["pos"])
+                data = f.read()
+        except OSError:
+            return 0
+        # Only process complete lines; leave any tail for next refresh.
+        end = data.rfind(b"\n")
+        if end < 0:
+            return 0
+        complete = data[: end + 1]
+        meta["pos"] += end + 1
+        added = 0
+        for raw in complete.splitlines():
+            result = self._parse(raw)
+            if result is None:
+                continue
+            ev_tuple, branch, cwd = result
+            ts, sid, model, in_, out, cc, cr = ev_tuple
+            self.events.append((ts, project, sid, model, in_, out, cc, cr))
+            sm = self.session_meta.get(sid)
+            if sm is None or ts >= sm.get("last_ts", 0):
+                self.session_meta[sid] = {
+                    "branch": branch,
+                    "cwd": cwd,
+                    "project": project,
+                    "model": model,
+                    "last_ts": ts,
+                }
+            added += 1
+        return added
+
+    def _parse(self, raw: bytes):
+        """Returns ((ts, sid, model, in, out, cc, cr), branch, cwd) or None."""
+        if not raw:
+            return None
+        try:
+            d = json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            self.errors += 1
+            return None
+        msg = d.get("message")
+        if not isinstance(msg, dict):
+            return None
+        usage = msg.get("usage")
+        if not isinstance(usage, dict):
+            return None
+        ts_str = d.get("timestamp")
+        if not ts_str:
+            return None
+        try:
+            ts = _iso_to_epoch(ts_str)
+        except (ValueError, TypeError):
+            self.errors += 1
+            return None
+        model = msg.get("model") or "?"
+        sid = d.get("sessionId") or "?"
+        ev = (
+            ts, sid, model,
+            int(usage.get("input_tokens", 0) or 0),
+            int(usage.get("output_tokens", 0) or 0),
+            int(usage.get("cache_creation_input_tokens", 0) or 0),
+            int(usage.get("cache_read_input_tokens", 0) or 0),
+        )
+        return ev, d.get("gitBranch") or "", d.get("cwd") or ""
+
+    # ── aggregations ────────────────────────────────────────────────
+
+    def aggregate(self, since: float = None, until: float = None) -> dict:
+        """Sum tokens within window. Returns dict with totals, by_project, by_model, by_session."""
+        z = lambda: dict(in_=0, out=0, cc=0, cr=0, msgs=0)  # noqa: E731
+        by_proj = defaultdict(z)
+        by_model = defaultdict(z)
+        by_session = {}
+        totals = z()
+        for ev in self.events:
+            ts = ev[self.TS]
+            if since is not None and ts < since:
+                continue
+            if until is not None and ts > until:
+                continue
+            proj = ev[self.PROJECT]
+            sid = ev[self.SID]
+            model = ev[self.MODEL]
+            in_, out, cc, cr = ev[self.IN], ev[self.OUT], ev[self.CC], ev[self.CR]
+            for bucket in (by_proj[proj], by_model[model], totals):
+                bucket["in_"] += in_
+                bucket["out"] += out
+                bucket["cc"] += cc
+                bucket["cr"] += cr
+                bucket["msgs"] += 1
+            s = by_session.get(sid)
+            if s is None:
+                s = dict(in_=0, out=0, cc=0, cr=0, msgs=0,
+                         project=proj, model=model, first=ts, last=ts)
+                by_session[sid] = s
+            s["in_"] += in_
+            s["out"] += out
+            s["cc"] += cc
+            s["cr"] += cr
+            s["msgs"] += 1
+            s["model"] = model  # keep last model used
+            if ts > s["last"]:
+                s["last"] = ts
+            if ts < s["first"]:
+                s["first"] = ts
+        return {
+            "totals": totals,
+            "by_project": dict(by_proj),
+            "by_model": dict(by_model),
+            "by_session": by_session,
+        }
+
+    def history_daily(self, days: int = 7) -> list:
+        """Returns [(date, total_tokens), …] oldest → newest, len == days."""
+        today = datetime.now().date()
+        buckets = {today - timedelta(days=i): 0 for i in range(days)}
+        for ev in self.events:
+            d = datetime.fromtimestamp(ev[self.TS]).date()
+            if d in buckets:
+                buckets[d] += ev[self.IN] + ev[self.OUT] + ev[self.CC] + ev[self.CR]
+        return sorted(buckets.items())
+
+    def session_events(self, sid: str) -> list:
+        """All events for a session, oldest-first."""
+        evs = [e for e in self.events if e[self.SID] == sid]
+        evs.sort(key=lambda e: e[self.TS])
+        return evs
+
+    def recent_burn(self, now: float, lookback_seconds: int = 1800) -> float:
+        """Tokens (in+out) per minute over the last lookback_seconds."""
+        cutoff = now - lookback_seconds
+        total = 0
+        for ev in self.events:
+            if ev[self.TS] >= cutoff:
+                total += ev[self.IN] + ev[self.OUT]
+        return total / (lookback_seconds / 60) if lookback_seconds > 0 else 0
+
+    def hourly_peaks(self, now_ts: float, hours: int = 24) -> list:
+        """For each of the last `hours` hours, return the *peak* tokens-per-minute
+        (input and output, separately) observed within that hour.
+
+        Same metric Anthropic's Console shows on the rate-limit charts. Computed
+        from the same `usage` numbers Anthropic returned for each request — just
+        bucketed locally.
+
+        Returns: [{"hour_ts": epoch, "max_in": int, "max_out": int}, …]
+                 oldest first, length == hours.
+        """
+        end_hour = int(now_ts // 3600) * 3600
+        start_hour = end_hour - (hours - 1) * 3600
+        # (hour_idx, minute_idx) -> [in_sum, out_sum]
+        by_minute: dict = defaultdict(lambda: [0, 0])
+        for ev in self.events:
+            ts = ev[self.TS]
+            if ts < start_hour or ts >= end_hour + 3600:
+                continue
+            hour_idx = int((ts - start_hour) // 3600)
+            minute_idx = int(ts // 60)
+            by_minute[(hour_idx, minute_idx)][0] += ev[self.IN]
+            by_minute[(hour_idx, minute_idx)][1] += ev[self.OUT]
+        peaks = [{"hour_ts": start_hour + h * 3600, "max_in": 0, "max_out": 0}
+                 for h in range(hours)]
+        for (hi, _mi), (mi_in, mi_out) in by_minute.items():
+            if 0 <= hi < hours:
+                if mi_in > peaks[hi]["max_in"]:
+                    peaks[hi]["max_in"] = mi_in
+                if mi_out > peaks[hi]["max_out"]:
+                    peaks[hi]["max_out"] = mi_out
+        return peaks
+
+    def historic_max_5h(self, now: float, days: int = 30) -> tuple:
+        """Sliding 5h window over last `days` days. Returns (max_in_out_tokens, end_ts).
+        end_ts is the epoch second at which the busiest window ended.
+        Excludes the currently-open 5h window (last 5h before `now`) so the bar
+        compares now vs. *previous* peaks, not now vs. itself.
+        """
+        cutoff_old = now - days * 86400
+        cutoff_recent = now - 5 * 3600  # exclude current rolling window
+        evs = sorted(
+            (e for e in self.events
+             if cutoff_old <= e[self.TS] <= cutoff_recent),
+            key=lambda e: e[self.TS],
+        )
+        if not evs:
+            return (0, 0)
+        window = 5 * 3600
+        best = 0
+        best_end = 0
+        left = 0
+        running = 0
+        for right, ev_r in enumerate(evs):
+            ts_r = ev_r[self.TS]
+            running += ev_r[self.IN] + ev_r[self.OUT]
+            while left < right and ts_r - evs[left][self.TS] > window:
+                running -= evs[left][self.IN] + evs[left][self.OUT]
+                left += 1
+            if running > best:
+                best = running
+                best_end = ts_r
+        return (best, best_end)
+
+
+def total_tokens(bucket: dict) -> int:
+    return bucket["in_"] + bucket["out"] + bucket["cc"] + bucket["cr"]
+
+
+def window_bounds(mode: str, now: float) -> tuple:
+    """Returns (since, until, label) for a window mode."""
+    for name, span in WINDOW_MODES:
+        if name == mode:
+            if span == "today":
+                start = datetime.fromtimestamp(now).replace(
+                    hour=0, minute=0, second=0, microsecond=0
+                ).timestamp()
+                return start, now, "today"
+            return now - span, now, name
+    return now - 5 * 3600, now, "5h"
+
+
+# ── view helpers ────────────────────────────────────────────────────
+
+
+def safe_addstr(stdscr, y, x, s, attr=0, w=None):
+    """addnstr that never throws on edge writes."""
+    if w is None:
+        _, w = stdscr.getmaxyx()
+    if y >= stdscr.getmaxyx()[0] or y < 0:
+        return
+    max_len = w - x - 1
+    if max_len <= 0:
+        return
+    try:
+        stdscr.addnstr(y, x, s, max_len, attr)
+    except curses.error:
+        pass
+
+
+def _split_widths(w: int) -> tuple:
+    """Returns (launchd_width, claude_width) or (full, 0) if too narrow."""
+    if w < 130:
+        return (w, 0)
+    launchd_w = max(70, min(w * 55 // 100, 100))
+    claude_w = w - launchd_w - 1  # 1 col separator
+    return (launchd_w, claude_w)
+
+
+# ── launchd pane ────────────────────────────────────────────────────
+
+
+def draw_launchd_pane(stdscr, x0, y0, w, h, all_jobs, selected, scroll,
+                      filter_str, focused: bool):
+    """Renders the launchd pane within rectangle (x0, y0, w, h).
+    Returns adjusted (scroll, selected, filtered_jobs).
+    """
+    if filter_str:
+        jobs = [j for j in all_jobs if filter_str.lower() in j["label"].lower()]
+    else:
+        jobs = all_jobs
+
+    running = sum(1 for j in jobs if j["pid"] not in ("-", "0", ""))
+    failed = sum(1 for j in jobs if j["exit"] not in ("-", "0", ""))
+
+    # Title
+    title_attr = curses.A_BOLD | (curses.color_pair(5) if focused else 0)
+    title = "LAUNCHD"
+    info = f"  {len(jobs)} jobs ({running} ok, {failed} fail)"
+    safe_addstr(stdscr, y0, x0, title, title_attr, x0 + w)
+    safe_addstr(stdscr, y0, x0 + len(title), info, 0, x0 + w)
+
+    # Compressed columns when split, full when full-width
+    compact = w < 110
+    if compact:
+        header = f" {'LABEL':<32} {'SCHEDULE':<14} {'PID':<6} {'STATUS':<10} {'LOG':>6}"
+    else:
+        header = f"{'STATUS':<7} {'LABEL':<48} {'SCHEDULE':<20} {'PID':<7} {'LAST EXIT':<11} LOG"
+    safe_addstr(stdscr, y0 + 2, x0, header, curses.A_BOLD | curses.A_UNDERLINE, x0 + w)
+
+    # Clamp selection
+    if selected >= len(jobs):
+        selected = max(0, len(jobs) - 1)
+    if selected < 0:
+        selected = 0
+
+    body_top = y0 + 3
+    body_h = h - 3 - 1  # leave 1 for footer
+
+    if selected < scroll:
+        scroll = selected
+    elif selected >= scroll + body_h:
+        scroll = selected - body_h + 1
+    if scroll < 0:
+        scroll = 0
+
+    for i, j in enumerate(jobs[scroll:scroll + body_h]):
+        y = body_top + i
+        is_sel = focused and (scroll + i == selected)
+        sel_attr = curses.A_REVERSE if is_sel else 0
+        color_attr = curses.color_pair(j["color"])
+        if j["color"] == 4:
+            color_attr |= curses.A_DIM
+
+        if compact:
+            label = j["label"][:29]
+            schedule = j["schedule"][:13]
+            pid = j["pid"][:5]
+            status_text = j["status_text"][:9]
+            log_str = human_size(j["log_size"])
+            row = f" {j['icon']}  {label:<29} {schedule:<14} {pid:<6} {status_text:<10} {log_str:>6}"
+            safe_addstr(stdscr, y, x0, row.ljust(w), sel_attr | color_attr, x0 + w)
+        else:
+            label = j["label"][:47]
+            schedule = j["schedule"][:19]
+            pid = j["pid"][:6]
+            status_text = j["status_text"][:10]
+            log_str = human_size(j["log_size"])
+            row = f" {j['icon']}     {label:<48} {schedule:<20} {pid:<7} {status_text:<11} {log_str:>5}"
+            row = row.ljust(w)
+            safe_addstr(stdscr, y, x0, row, sel_attr | color_attr, x0 + w)
+
+    return scroll, selected, jobs
+
+
+# ── claude pane ─────────────────────────────────────────────────────
+
+
+def draw_claude_pane(stdscr, x0, y0, w, h, index: ClaudeIndex,
+                     limits: 'LimitsFetcher',
+                     window_mode: str, sel_idx: int, focused: bool):
+    """Renders the Claude usage pane. Returns (sel_idx, sessions_list)."""
+    now = datetime.now().timestamp()
+    since, until, label = window_bounds(window_mode, now)
+    agg = index.aggregate(since=since, until=until)
+
+    title_attr = curses.A_BOLD | (curses.color_pair(5) if focused else 0)
+    safe_addstr(stdscr, y0, x0, "CLAUDE", title_attr, x0 + w)
+    safe_addstr(stdscr, y0, x0 + 6, f"  window: {label}  (v cycle)", 0, x0 + w)
+
+    y = y0 + 2
+
+    # ── Anthropic real limits (from /v1/messages response headers) ──
+    safe_addstr(stdscr, y, x0,
+                "Anthropic limits (live from API headers)",
+                curses.A_UNDERLINE, x0 + w)
+    y += 1
+    ld = limits.data or {}
+    bar_w = max(8, w - 30)
+    if ld and "error" not in ld:
+        for label_, util_key, reset_key, status_key in (
+            ("5h", "5h_util", "5h_reset", "5h_status"),
+            ("7d", "7d_util", "7d_reset", "7d_status"),
+        ):
+            util = ld.get(util_key)
+            status = ld.get(status_key) or "?"
+            reset = ld.get(reset_key)
+            if util is None:
+                safe_addstr(stdscr, y, x0,
+                            f"  {label_}  (header missing)",
+                            curses.A_DIM, x0 + w)
+                y += 1
+                continue
+            bar = _bar(min(1.0, util), bar_w)
+            if util >= 0.95:
+                attr = curses.color_pair(2) | curses.A_BOLD
+            elif util >= 0.8:
+                attr = curses.color_pair(3) | curses.A_BOLD
+            else:
+                attr = 0
+            if reset:
+                secs = max(0, int(reset - now))
+                if secs >= 60:
+                    reset_str = _fmt_duration(secs / 60)
+                else:
+                    reset_str = f"{secs}s"
+            else:
+                reset_str = "?"
+            line = (f"  {label_}  {int(util * 100):>3}% {bar} "
+                    f"reset {reset_str:<7} {status}")
+            safe_addstr(stdscr, y, x0, line, attr, x0 + w)
+            y += 1
+        # Footer: cache age + refresh hint
+        age = int(limits.age_seconds())
+        age_str = "fetching…" if limits.fetching else (
+            f"{age}s ago" if age < 60 else
+            f"{age // 60}m ago" if age < 3600 else
+            f"{age // 3600}h ago"
+        )
+        safe_addstr(stdscr, y, x0,
+                    f"  fetched {age_str}  (f to refresh)",
+                    curses.A_DIM, x0 + w)
+        y += 2
+    elif ld and "error" in ld:
+        safe_addstr(stdscr, y, x0, f"  error: {ld['error'][:60]}",
+                    curses.color_pair(2), x0 + w)
+        y += 1
+        if limits.fetching:
+            safe_addstr(stdscr, y, x0, "  retrying…", curses.A_DIM, x0 + w)
+        else:
+            safe_addstr(stdscr, y, x0, "  press 'f' to retry",
+                        curses.A_DIM, x0 + w)
+        y += 2
+    else:
+        msg = "  fetching…" if limits.fetching else "  press 'f' to fetch"
+        safe_addstr(stdscr, y, x0, msg, curses.A_DIM, x0 + w)
+        y += 2
+
+    # ── Local activity (from your Claude Code logs) ──
+    safe_addstr(stdscr, y, x0,
+                f"Local activity (window: {label})",
+                curses.A_UNDERLINE, x0 + w)
+    y += 1
+    totals = agg["totals"]
+    since_str = datetime.fromtimestamp(since).strftime("%H:%M")
+    until_str = datetime.fromtimestamp(until).strftime("%H:%M")
+    line1 = f"  {since_str}–{until_str}  {len(agg['by_session'])} sess  {totals['msgs']} msgs"
+    safe_addstr(stdscr, y, x0, line1, curses.A_DIM, x0 + w)
+    y += 1
+    line2 = (
+        f"  in {_fmt_tokens(totals['in_'])}   "
+        f"out {_fmt_tokens(totals['out'])}   "
+        f"cache {_fmt_tokens(totals['cc'] + totals['cr'])}"
+    )
+    safe_addstr(stdscr, y, x0, line2, 0, x0 + w)
+    y += 2
+
+    # By model
+    by_model = agg["by_model"]
+    if by_model:
+        safe_addstr(stdscr, y, x0, "By model", curses.A_UNDERLINE, x0 + w)
+        y += 1
+        ranked = sorted(by_model.items(), key=lambda kv: -total_tokens(kv[1]))
+        biggest = max(total_tokens(b) for _, b in ranked) or 1
+        bar_w = max(6, w - 32)
+        for model, b in ranked[:4]:
+            if y >= y0 + h - 2:
+                break
+            v = total_tokens(b)
+            frac = v / biggest if biggest else 0
+            name = _short_model(model)[:14]
+            line = f"  {name:<14} {_bar(frac, bar_w)}  {_fmt_tokens(v):>6}"
+            safe_addstr(stdscr, y, x0, line, 0, x0 + w)
+            y += 1
+        y += 1
+
+    # By project
+    by_proj = agg["by_project"]
+    if by_proj and y < y0 + h - 6:
+        safe_addstr(stdscr, y, x0, "By project", curses.A_UNDERLINE, x0 + w)
+        y += 1
+        ranked = sorted(by_proj.items(), key=lambda kv: -total_tokens(kv[1]))
+        biggest = max(total_tokens(b) for _, b in ranked) or 1
+        bar_w = max(6, w - 32)
+        for proj, b in ranked[:4]:
+            if y >= y0 + h - 2:
+                break
+            v = total_tokens(b)
+            frac = v / biggest if biggest else 0
+            name = (proj or "?")[:14]
+            line = f"  {name:<14} {_bar(frac, bar_w)}  {_fmt_tokens(v):>6}"
+            safe_addstr(stdscr, y, x0, line, 0, x0 + w)
+            y += 1
+        y += 1
+
+    # Active sessions (selectable)
+    sessions = sorted(
+        agg["by_session"].items(),
+        key=lambda kv: -kv[1]["last"],
+    )
+    # Always return the full session list so Enter can dispatch on sel_idx,
+    # even if the visible window is smaller than the list.
+    sessions_list = list(sessions)
+    if sessions and y < y0 + h - 4:
+        safe_addstr(stdscr, y, x0, "Sessions", curses.A_UNDERLINE, x0 + w)
+        y += 1
+        if sel_idx >= len(sessions):
+            sel_idx = max(0, len(sessions) - 1)
+        if sel_idx < 0:
+            sel_idx = 0
+        max_rows = max(1, y0 + h - y - 4)  # leave room for 7d trend
+        sw_start = max(0, min(sel_idx - max_rows // 2,
+                              max(0, len(sessions) - max_rows)))
+        for i, (sid, b) in enumerate(sessions[sw_start:sw_start + max_rows]):
+            actual_i = sw_start + i
+            is_sel = focused and (actual_i == sel_idx)
+            sel_attr = curses.A_REVERSE if is_sel else 0
+            sm = index.session_meta.get(sid, {})
+            branch = sm.get("branch") or ""
+            cwd = sm.get("cwd") or ""
+            # Prefer git branch; fall back to cwd basename; fall back to project.
+            if branch:
+                ident = _short_branch(branch, 22)
+            elif cwd:
+                ident = _short_branch(os.path.basename(cwd) or "?", 22)
+            else:
+                ident = (b["project"] or "?")[:22]
+            model = _short_model(b["model"])[:11]
+            rel = _fmt_relative(b["last"], now)
+            tok = _fmt_tokens(total_tokens(b))
+            line = f"  {ident:<22} {model:<11} {rel:<8} {tok:>6}  {sid[:6]}"
+            safe_addstr(stdscr, y, x0, line.ljust(w), sel_attr, x0 + w)
+            y += 1
+        y += 1
+
+    # 24h chart — peak tokens/min per hour, two sparklines stacked.
+    # Same metric the Anthropic Console shows on the rate-limit graph,
+    # computed from your local JSONL (which logs Anthropic's usage values verbatim).
+    if y < y0 + h - 4:
+        safe_addstr(stdscr, y, x0,
+                    "Last 24h — peak tokens/min per hour",
+                    curses.A_UNDERLINE, x0 + w)
+        y += 1
+        peaks = index.hourly_peaks(now, hours=24)
+        in_vals = [p["max_in"] for p in peaks]
+        out_vals = [p["max_out"] for p in peaks]
+        in_max = max(in_vals) if in_vals else 0
+        out_max = max(out_vals) if out_vals else 0
+        spark_w = min(24, max(8, w - 26))
+        # Trim to last `spark_w` hours so the chart fits the pane width
+        in_view = in_vals[-spark_w:]
+        out_view = out_vals[-spark_w:]
+        peaks_view = peaks[-spark_w:]
+        in_spark = _sparkline(in_view, in_max)
+        out_spark = _sparkline(out_view, out_max)
+
+        def peak_label(vals, m):
+            if m <= 0:
+                return ""
+            i = vals.index(m)
+            t = datetime.fromtimestamp(peaks_view[i]["hour_ts"]).strftime("%H:%M")
+            return f"  peak {_fmt_tokens(m)} @{t}"
+
+        safe_addstr(stdscr, y, x0,
+                    f"  in   {in_spark}{peak_label(in_view, in_max)}",
+                    curses.color_pair(1), x0 + w)
+        y += 1
+        safe_addstr(stdscr, y, x0,
+                    f"  out  {out_spark}{peak_label(out_view, out_max)}",
+                    curses.color_pair(5), x0 + w)
+        y += 1
+        if peaks_view:
+            t0 = datetime.fromtimestamp(peaks_view[0]["hour_ts"]).strftime("%H:%M")
+            tn = datetime.fromtimestamp(peaks_view[-1]["hour_ts"]).strftime("%H:%M")
+            axis = f"       {t0}{' ' * max(1, spark_w - 10)}{tn}"
+            safe_addstr(stdscr, y, x0, axis, curses.A_DIM, x0 + w)
+            y += 1
+
+    return sel_idx, sessions_list
+
+
+# ── modals ──────────────────────────────────────────────────────────
+
+
+def edit_filter(stdscr, current):
+    h, _w = stdscr.getmaxyx()
+    curses.curs_set(1)
+    buf = current
+    while True:
+        stdscr.move(h - 1, 0)
+        stdscr.clrtoeol()
+        prompt = f"/{buf}"
+        safe_addstr(stdscr, h - 1, 0, prompt, 0)
+        try:
+            stdscr.move(h - 1, min(len(prompt), stdscr.getmaxyx()[1] - 1))
+        except curses.error:
+            pass
+        stdscr.refresh()
+        ch = stdscr.getch()
+        if ch == 27:  # ESC
+            curses.curs_set(0)
+            return None
+        if ch in (10, 13):  # Enter
+            curses.curs_set(0)
+            return buf
+        if ch in (curses.KEY_BACKSPACE, 127, 8):
+            buf = buf[:-1]
+        elif 32 <= ch < 127:
+            buf += chr(ch)
+
+
+def tail_log(stdscr, job):
+    """Live-follow a launchd job's log file. Any key returns."""
+    log = job.get("log_path")
+    stderr = job.get("stderr_path")
+    log_path = os.path.expanduser(log) if log else None
+    stderr_path = os.path.expanduser(stderr) if stderr and stderr != log else None
+
+    if not log_path and not stderr_path:
+        stdscr.erase()
+        safe_addstr(stdscr, 0, 0, f"Log peek — {job['label']}", curses.A_BOLD)
+        safe_addstr(stdscr, 2, 0, "(no log path configured in plist)", curses.A_DIM)
+        safe_addstr(stdscr, 4, 0, "press any key to return", curses.A_DIM)
+        stdscr.refresh()
+        stdscr.timeout(-1)
+        stdscr.getch()
+        stdscr.timeout(2000)
+        return
+
+    files = {}
+    for p in (log_path, stderr_path):
+        if p:
+            files[p] = None
+
+    def open_or_seek(path, prev_handle):
+        try:
+            new_size = os.path.getsize(path)
+        except OSError:
+            return None, 0
+        if prev_handle is None:
+            f = open(path, "rb")
+            f.seek(max(0, new_size - 8192))
+            return f, new_size
+        try:
+            cur = prev_handle.tell()
+        except OSError:
+            cur = 0
+        if new_size < cur:
+            prev_handle.close()
+            f = open(path, "rb")
+            return f, new_size
+        return prev_handle, new_size
+
+    stdscr.erase()
+    h, w = stdscr.getmaxyx()
+    safe_addstr(stdscr, 0, 0, f"Live log — {job['label']}", curses.A_BOLD, w)
+    paths_str = " + ".join(p for p in (log_path, stderr_path) if p)
+    safe_addstr(stdscr, 1, 0, paths_str, curses.A_DIM, w)
+    safe_addstr(stdscr, h - 1, 0, "any key to return", curses.A_DIM, w)
+    stdscr.refresh()
+
+    MAX_LINES = 5000
+    buf = []
+    handles = {}
+    sizes = {}
+
+    for p in files:
+        h_, s_ = open_or_seek(p, None)
+        handles[p] = h_
+        sizes[p] = s_
+        if h_:
+            try:
+                data = h_.read().decode("utf-8", errors="replace")
+                if data:
+                    buf.extend((p, ln) for ln in data.splitlines())
+            except OSError:
+                pass
+
+    stdscr.timeout(500)
+    try:
+        while True:
+            for p, fh in list(handles.items()):
+                if fh is None:
+                    nh, ns = open_or_seek(p, None)
+                    handles[p], sizes[p] = nh, ns
+                    fh = nh
+                if fh is None:
+                    continue
+                try:
+                    new_data = fh.read().decode("utf-8", errors="replace")
+                except OSError:
+                    new_data = ""
+                if new_data:
+                    new_lines = new_data.splitlines()
+                    buf.extend((p, ln) for ln in new_lines)
+            if len(buf) > MAX_LINES:
+                buf = buf[-MAX_LINES:]
+
+            stdscr.erase()
+            h, w = stdscr.getmaxyx()
+            safe_addstr(stdscr, 0, 0, f"Live log — {job['label']}", curses.A_BOLD, w)
+            safe_addstr(stdscr, 1, 0, paths_str, curses.A_DIM, w)
+            safe_addstr(stdscr, h - 1, 0, "any key to return  (following)", curses.A_DIM, w)
+
+            visible = h - 4
+            tail = buf[-visible:] if visible > 0 else []
+            for i, (src, ln) in enumerate(tail):
+                attr = curses.color_pair(2) if src == stderr_path else 0
+                safe_addstr(stdscr, 3 + i, 0, ln, attr, w)
+
+            stdscr.refresh()
+            ch = stdscr.getch()
+            if ch != -1:
+                break
+    finally:
+        for fh in handles.values():
+            if fh is not None:
+                try:
+                    fh.close()
+                except OSError:
+                    pass
+        stdscr.timeout(2000)
+
+
+def tail_claude_session(stdscr, index: ClaudeIndex, sid: str, project: str):
+    """Live tail one Claude session — each new assistant message renders one row.
+
+    The ClaudeIndex is shared, so periodic refresh() picks up new events
+    appended to the session's JSONL file and we render the deltas.
+    """
+    stdscr.timeout(1000)
+    seen = len(index.events)
+    rows = []  # (ts, model, in, out, cc, cr)
+    for ev in index.session_events(sid):
+        rows.append((ev[ClaudeIndex.TS], ev[ClaudeIndex.MODEL],
+                     ev[ClaudeIndex.IN], ev[ClaudeIndex.OUT],
+                     ev[ClaudeIndex.CC], ev[ClaudeIndex.CR]))
+    MAX_ROWS = 1000
+    try:
+        while True:
+            stdscr.erase()
+            h, w = stdscr.getmaxyx()
+            safe_addstr(stdscr, 0, 0, f"Session tail — {project}/{sid[:8]}", curses.A_BOLD, w)
+            safe_addstr(stdscr, 1, 0,
+                        f"{len(rows)} messages   any key to return", curses.A_DIM, w)
+            header = f"  {'TIME':<8} {'MODEL':<14} {'IN':>8} {'OUT':>8} {'CC':>8} {'CR':>8}"
+            safe_addstr(stdscr, 3, 0, header, curses.A_UNDERLINE, w)
+
+            visible = max(1, h - 5)
+            tail = rows[-visible:]
+            cumul = sum(r[2] + r[3] + r[4] + r[5] for r in rows)
+
+            for i, (ts, model, in_, out, cc, cr) in enumerate(tail):
+                t_str = datetime.fromtimestamp(ts).strftime("%H:%M:%S")
+                line = (f"  {t_str:<8} {_short_model(model)[:14]:<14} "
+                        f"{_fmt_tokens(in_):>8} {_fmt_tokens(out):>8} "
+                        f"{_fmt_tokens(cc):>8} {_fmt_tokens(cr):>8}")
+                safe_addstr(stdscr, 4 + i, 0, line, 0, w)
+
+            footer = f"Σ {_fmt_tokens(cumul)} tokens"
+            safe_addstr(stdscr, h - 1, 0, footer.ljust(w - 1), curses.A_BOLD, w)
+
+            stdscr.refresh()
+            ch = stdscr.getch()
+            if ch != -1:
+                break
+
+            # Refresh the index, append new events for this session
+            added = index.refresh()
+            if added:
+                # Only consider events appended since we entered this view
+                for ev in index.events[seen:]:
+                    if ev[ClaudeIndex.SID] == sid:
+                        rows.append((ev[ClaudeIndex.TS], ev[ClaudeIndex.MODEL],
+                                     ev[ClaudeIndex.IN], ev[ClaudeIndex.OUT],
+                                     ev[ClaudeIndex.CC], ev[ClaudeIndex.CR]))
+                seen = len(index.events)
+                if len(rows) > MAX_ROWS:
+                    rows = rows[-MAX_ROWS:]
+    finally:
+        stdscr.timeout(2000)
+
+
+# ── main ────────────────────────────────────────────────────────────
+
+
+def draw(stdscr, jobs, sel_l, scroll_l, filter_str,
+         index, limits, sel_c, window_mode, focus, status_msg=""):
+    stdscr.erase()
+    h, w = stdscr.getmaxyx()
+    user = getpass.getuser()
+
+    # Top header
+    title = "agenttop"
+    info = f"  {user}   "
+    keys = "Tab focus  q quit  r refresh  f fetch"
+    safe_addstr(stdscr, 0, 0, title, curses.A_BOLD, w)
+    safe_addstr(stdscr, 0, len(title), info, curses.A_DIM, w)
+    if w > len(title) + len(info) + len(keys) + 3:
+        safe_addstr(stdscr, 0, w - len(keys) - 1, keys, curses.A_DIM, w)
+
+    launchd_w, claude_w = _split_widths(w)
+    body_top = 1
+    body_h = h - body_top - 1  # leave 1 for footer
+
+    sessions_list = []
+    if claude_w == 0:
+        if focus == "launchd":
+            scroll_l, sel_l, _filtered = draw_launchd_pane(
+                stdscr, 0, body_top, w, body_h, jobs, sel_l, scroll_l,
+                filter_str, focused=True,
+            )
+        else:
+            sel_c, sessions_list = draw_claude_pane(
+                stdscr, 0, body_top, w, body_h, index, limits,
+                window_mode, sel_c, focused=True,
+            )
+    else:
+        scroll_l, sel_l, _filtered = draw_launchd_pane(
+            stdscr, 0, body_top, launchd_w, body_h, jobs, sel_l, scroll_l,
+            filter_str, focused=(focus == "launchd"),
+        )
+        for y in range(body_top, body_top + body_h):
+            safe_addstr(stdscr, y, launchd_w, "│", curses.A_DIM, w)
+        sel_c, sessions_list = draw_claude_pane(
+            stdscr, launchd_w + 1, body_top, claude_w, body_h, index,
+            limits, window_mode, sel_c, focused=(focus == "claude"),
+        )
+
+    # Footer
+    footer_y = h - 1
+    if status_msg:
+        attr = curses.color_pair(2) | curses.A_BOLD if "fail" in status_msg.lower() \
+               else curses.color_pair(1) | curses.A_BOLD
+        safe_addstr(stdscr, footer_y, 0, status_msg, attr, w)
+    elif filter_str and focus == "launchd":
+        safe_addstr(stdscr, footer_y, 0,
+                    f"filter: /{filter_str}    (c to clear)", curses.A_DIM, w)
+    else:
+        hint = ("[launchd] / filter  R restart  s stop  Enter tail"
+                if focus == "launchd"
+                else "[claude]  v window  f fetch limits  Enter session tail")
+        safe_addstr(stdscr, footer_y, 0, hint, curses.A_DIM, w)
+
+    stdscr.refresh()
+    return scroll_l, sel_l, sel_c, sessions_list
+
+
+def main(stdscr):
+    curses.curs_set(0)
+    curses.start_color()
+    curses.use_default_colors()
+    curses.init_pair(1, curses.COLOR_GREEN, -1)    # ok / running
+    curses.init_pair(2, curses.COLOR_RED, -1)      # error
+    curses.init_pair(3, curses.COLOR_YELLOW, -1)   # warning
+    curses.init_pair(4, -1, -1)                    # idle
+    curses.init_pair(5, curses.COLOR_CYAN, -1)     # focused pane title
+
+    stdscr.timeout(2000)
+
+    # Initial scan can take a moment on big indexes — show a splash.
+    stdscr.erase()
+    h, w = stdscr.getmaxyx()
+    safe_addstr(stdscr, h // 2, max(0, (w - 28) // 2),
+                "scanning ~/.claude/projects…", curses.A_DIM)
+    stdscr.refresh()
+
+    index = ClaudeIndex()
+    index.refresh()
+    index.save()  # warm/refresh the on-disk cache (prunes internally)
+    last_save = time.time()
+    limits = LimitsFetcher()
+    if limits.is_stale():
+        limits.fetch_async()  # background; UI shows cached value or "fetching…"
+
+    jobs = collect_jobs()
+    sel_l = 0
+    scroll_l = 0
+    sel_c = 0
+    filter_str = ""
+    window_mode = "5h"
+    focus = "launchd"
+    status_msg = ""
+    status_msg_until = 0
+    tick = 0
+
+    def current_view():
+        return [j for j in jobs if filter_str.lower() in j["label"].lower()] if filter_str else jobs
+
+    while True:
+        scroll_l, sel_l, sel_c, sessions_list = draw(
+            stdscr, jobs, sel_l, scroll_l, filter_str,
+            index, limits, sel_c, window_mode, focus, status_msg,
+        )
+        ch = stdscr.getch()
+        tick += 1
+        if status_msg and tick > status_msg_until:
+            status_msg = ""
+        if ch == -1:
+            jobs = collect_jobs()
+            added = index.refresh()
+            if limits.is_stale():
+                limits.fetch_async()
+            if added and time.time() - last_save > SAVE_INTERVAL_SECONDS:
+                index.save()
+                last_save = time.time()
+            continue
+
+        # Global keys
+        if ch in (ord('q'), ord('Q')):
+            index.save()
+            break
+        if ch == 9:  # Tab
+            focus = "claude" if focus == "launchd" else "launchd"
+            continue
+        if ch == ord('r'):
+            jobs = collect_jobs()
+            index.refresh()
+            status_msg = "Refreshed"
+            status_msg_until = tick + 2
+            continue
+        if ch == ord('f'):
+            limits.fetch_async()
+            status_msg = "Fetching Anthropic limits…"
+            status_msg_until = tick + 4
+            continue
+
+        # Pane-specific keys
+        if focus == "launchd":
+            if ch == ord('/'):
+                new = edit_filter(stdscr, filter_str)
+                if new is not None:
+                    filter_str = new
+                    sel_l = 0
+                    scroll_l = 0
+            elif ch == ord('c'):
+                filter_str = ""
+                sel_l = 0
+                scroll_l = 0
+            elif ch in (curses.KEY_DOWN, ord('j')):
+                sel_l += 1
+            elif ch in (curses.KEY_UP, ord('k')):
+                sel_l = max(0, sel_l - 1)
+            elif ch == ord('g'):
+                sel_l = 0
+                scroll_l = 0
+            elif ch == ord('G'):
+                sel_l = len(jobs) - 1
+            elif ch == ord('R'):
+                view = current_view()
+                if 0 <= sel_l < len(view):
+                    status_msg = restart_job(view[sel_l])
+                    status_msg_until = tick + 4
+                    jobs = collect_jobs()
+            elif ch == ord('s'):
+                view = current_view()
+                if 0 <= sel_l < len(view):
+                    status_msg = stop_job(view[sel_l])
+                    status_msg_until = tick + 4
+                    jobs = collect_jobs()
+            elif ch in (10, 13):
+                view = current_view()
+                if 0 <= sel_l < len(view):
+                    tail_log(stdscr, view[sel_l])
+        else:  # focus == "claude"
+            if ch in (curses.KEY_DOWN, ord('j')):
+                sel_c += 1
+            elif ch in (curses.KEY_UP, ord('k')):
+                sel_c = max(0, sel_c - 1)
+            elif ch == ord('v'):
+                modes = [m for m, _ in WINDOW_MODES]
+                window_mode = modes[(modes.index(window_mode) + 1) % len(modes)]
+            elif ch in (10, 13):
+                if 0 <= sel_c < len(sessions_list):
+                    sid, info = sessions_list[sel_c]
+                    tail_claude_session(stdscr, index, sid, info["project"])
+
+
+# ── entrypoint ──────────────────────────────────────────────────────
+
+
+def _once_launchd():
+    for j in collect_jobs():
+        print(f"{j['icon']} {j['label']:<50} {j['schedule']:<22} pid={j['pid']:<6} {j['status_text']:<14} log={human_size(j['log_size'])}")
+
+
+def _once_claude():
+    idx = ClaudeIndex()
+    idx.refresh()
+    idx.save()  # warm/refresh the shared on-disk cache
+    now = datetime.now().timestamp()
+    agg = idx.aggregate(since=now - 5 * 3600, until=now)
+    t = agg["totals"]
+    print("=== Anthropic real rate-limit headers ===")
+    fetch_arg = "--no-fetch" not in sys.argv
+    if fetch_arg:
+        print("(making one tiny `claude -p .` call to read headers — costs 1 message)")
+        ld = fetch_anthropic_limits()
+        if ld and "error" not in ld:
+            try:
+                LIMITS_CACHE.parent.mkdir(parents=True, exist_ok=True)
+                LIMITS_CACHE.write_text(json.dumps(ld))
+            except OSError:
+                pass
+    else:
+        try:
+            ld = json.loads(LIMITS_CACHE.read_text())
+            age = int(time.time() - ld.get("ts", 0))
+            print(f"(using cached headers, {age}s old; pass --fetch to refresh)")
+        except (OSError, json.JSONDecodeError):
+            ld = {}
+    if "error" in ld:
+        print(f"  error: {ld['error']}")
+    elif ld:
+        for k in ("5h", "7d"):
+            u = ld.get(f"{k}_util")
+            r = ld.get(f"{k}_reset")
+            s = ld.get(f"{k}_status")
+            if u is not None:
+                reset_str = (datetime.fromtimestamp(r).strftime("%a %d %H:%M")
+                             if r else "?")
+                print(f"  {k}: {u * 100:5.1f}% used  status={s}  resets at {reset_str}")
+        print(f"  overall status: {ld.get('status')}  "
+              f"representative claim: {ld.get('representative')}")
+    print()
+    print(f"=== Local activity (last 5h, from ~/.claude/projects/*.jsonl) ===")
+    print(f"sessions: {len(agg['by_session'])}   messages: {t['msgs']}")
+    print(f"in {_fmt_tokens(t['in_'])}  out {_fmt_tokens(t['out'])}  "
+          f"cc {_fmt_tokens(t['cc'])}  cr {_fmt_tokens(t['cr'])}  "
+          f"Σ {_fmt_tokens(total_tokens(t))}")
+    print()
+    print("By model:")
+    for m, b in sorted(agg["by_model"].items(), key=lambda kv: -total_tokens(kv[1])):
+        print(f"  {_short_model(m):<16} Σ {_fmt_tokens(total_tokens(b)):>8}  msgs {b['msgs']}")
+    print()
+    print("Active sessions (branch / model / last / tokens):")
+    sess_sorted = sorted(agg["by_session"].items(), key=lambda kv: -kv[1]["last"])
+    for sid, b in sess_sorted[:10]:
+        sm = idx.session_meta.get(sid, {})
+        branch = sm.get("branch") or os.path.basename(sm.get("cwd") or "") or b["project"]
+        print(f"  {_short_branch(branch, 32):<32} {_short_model(b['model']):<14} "
+              f"{_fmt_relative(b['last'], now):<10} Σ {_fmt_tokens(total_tokens(b)):>8}  {sid[:6]}")
+    print()
+    print("Last 24h — peak tokens/min per hour:")
+    peaks = idx.hourly_peaks(now, hours=24)
+    in_vals = [p["max_in"] for p in peaks]
+    out_vals = [p["max_out"] for p in peaks]
+    in_max = max(in_vals) if in_vals else 0
+    out_max = max(out_vals) if out_vals else 0
+    print(f"  in   {_sparkline(in_vals, in_max)}    peak {_fmt_tokens(in_max)}")
+    print(f"  out  {_sparkline(out_vals, out_max)}    peak {_fmt_tokens(out_max)}")
+    if peaks:
+        t0 = datetime.fromtimestamp(peaks[0]["hour_ts"]).strftime("%H:%M")
+        tn = datetime.fromtimestamp(peaks[-1]["hour_ts"]).strftime("%H:%M")
+        print(f"       {t0}{' ' * 18}{tn}")
+
+
+if __name__ == "__main__":
+    if "--once" in sys.argv:
+        _once_launchd()
+        sys.exit(0)
+    if "--once-claude" in sys.argv:
+        _once_claude()
+        sys.exit(0)
+    try:
+        curses.wrapper(main)
+    except KeyboardInterrupt:
+        pass
