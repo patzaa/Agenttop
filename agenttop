@@ -375,26 +375,69 @@ def stop_job(job):
 # bridge/tunnel agents, com.dan.* the personal crons (found by audit 2026-07-15).
 FLEET_PREFIXES = ("com.hausverwaltung.", "com.houseclaw.", "com.dan.")
 
-# Health states, most-severe first (drives sort + colour).
-HEALTH_ORDER = ("failing", "blocked", "dead", "stale", "recovering", "transient", "healthy", "unknown")
+# Health states, most-severe first (drives sort + colour). "disabled" sits at
+# the bottom: deliberately off is the least urgent thing on the board.
+HEALTH_ORDER = ("failing", "blocked", "dead", "stale", "recovering", "transient",
+                "healthy", "disabled", "unknown")
 # Single-width glyphs on purpose: emoji are double-width in most terminals and
 # shear every column to their right in curses. Colour carries the severity.
 HEALTH_ICON = {
     "failing": "✗", "blocked": "⚠", "dead": "✗", "stale": "⚠",
-    "recovering": "↻", "transient": "○", "healthy": "●", "unknown": "?",
+    "recovering": "↻", "transient": "○", "healthy": "●", "disabled": "-",
+    "unknown": "?",
 }
 HEALTH_COLOR = {  # curses colour-pair ids defined in main()
-    # B2 „Papier": nur die Abweichung bekommt Farbe. healthy/recovering/transient
-    # sind gedimmte Glyphen (pair 5) — gesund ist stumm, nie grün.
+    # Dan-Override 2026-07-15: healthy/recovering = GRÜN (pair 1); grau (pair 5)
+    # heißt INAKTIV — disabled + transient. Grau darf nie "gesund" bedeuten,
+    # weil Agenten per 'x' abschaltbar sind und grau = aus gelesen wird.
     "failing": 2, "blocked": 3, "dead": 2, "stale": 3,
-    "recovering": 5, "transient": 5, "healthy": 5, "unknown": 4,
+    "recovering": 1, "transient": 5, "healthy": 1, "disabled": 5, "unknown": 4,
 }
 HEALTH_LABEL_DE = {
     "failing": "FAILING — braucht dich", "blocked": "BLOCKED — skippt jeden Lauf",
     "dead": "DEAD — nicht geladen", "stale": "STALE — überfällig",
     "recovering": "recovering — klärt sich", "transient": "transient — harmlos",
-    "healthy": "healthy", "unknown": "unbekannt",
+    "healthy": "healthy", "disabled": "disabled — bewusst aus",
+    "unknown": "unbekannt",
 }
+
+# launchctl print-disabled is one subprocess for the WHOLE domain — cache it a
+# few ticks instead of paying it once per agent per 2s refresh.
+_DISABLED_CACHE = {"ts": 0.0, "labels": frozenset()}
+
+
+def disabled_labels() -> frozenset:
+    now = time.time()
+    if now - _DISABLED_CACHE["ts"] < 5:
+        return _DISABLED_CACHE["labels"]
+    try:
+        out = subprocess.run(["launchctl", "print-disabled", f"gui/{os.getuid()}"],
+                             capture_output=True, text=True, timeout=5).stdout
+        labels = frozenset(re.findall(r'"([^"]+)"\s*=>\s*(?:true|disabled)', out))
+    except (subprocess.SubprocessError, OSError):
+        labels = _DISABLED_CACHE["labels"]
+    _DISABLED_CACHE.update(ts=now, labels=labels)
+    return labels
+
+
+def toggle_agent(job: dict) -> str:
+    """'x': flip an agent between active and deliberately-off. Disable is
+    PERSISTENT (survives reboots) + bootout unloads it now; enable + bootstrap
+    brings it back immediately. Both directions are fully reversible."""
+    label = job["label"]
+    target = f"gui/{os.getuid()}"
+    if label in disabled_labels():
+        subprocess.run(["launchctl", "enable", f"{target}/{label}"], capture_output=True, timeout=10)
+        r = subprocess.run(["launchctl", "bootstrap", target, job.get("plist_path", "")],
+                           capture_output=True, text=True, timeout=10)
+        _DISABLED_CACHE["ts"] = 0.0  # force re-read on next tick
+        return (f"{label.split('.')[-1]} AN (enable + bootstrap)" if r.returncode == 0
+                else f"enable ok, bootstrap: {(r.stderr or r.stdout).strip().splitlines()[-1] if (r.stderr or r.stdout) else 'Fehler'}")
+    subprocess.run(["launchctl", "bootout", f"{target}/{label}"], capture_output=True, timeout=10)
+    r = subprocess.run(["launchctl", "disable", f"{target}/{label}"], capture_output=True, text=True, timeout=10)
+    _DISABLED_CACHE["ts"] = 0.0
+    return (f"{label.split('.')[-1]} AUS (bootout + disable — 'x' schaltet wieder an)"
+            if r.returncode == 0 else "disable fehlgeschlagen")
 
 
 def is_fleet_agent(label: str) -> bool:
@@ -435,6 +478,10 @@ def _log_tail(path: str, n: int = 60) -> list:
 def agent_health(job: dict) -> dict:
     """Classify one fleet agent: {state, symptom, fix}. A silent skip exits 0, so
     trust the log tail's most-recent outcome over LastExitStatus."""
+    # Deliberately switched off ('x') — grey by design, and no other check
+    # applies: an off agent has no pid, no fresh log, and that is CORRECT.
+    if job["label"] in disabled_labels():
+        return {"state": "disabled", "symptom": "bewusst abgeschaltet ('x' schaltet wieder an)", "fix": ""}
     # A keep-alive service that is running RIGHT NOW is healthy no matter how old
     # its log is (bridge/tunnel write nothing for days when traffic is quiet).
     if job["pid"] not in ("-", "", None):
@@ -1713,7 +1760,7 @@ def draw_agent_detail_pane(stdscr, x0, y0, w, h, job):
             attr = curses.color_pair(2) if re.search(r"ERROR|FAIL", ln) else curses.A_DIM
             safe_addstr(stdscr, tail_top + 1 + i, x0, " " + ln[: w - 2], attr, clamp)
     if is_fleet_agent(job["label"]):
-        bar = " ↵ Fix mit Claude   R restart   l Log   a alle Jobs"
+        bar = " ↵ Fix mit Claude   x an/aus   R restart   l Log"
         safe_addstr(stdscr, y0 + h - 1, x0, bar[: w - 1], curses.A_BOLD, clamp)
 
 
@@ -1794,7 +1841,7 @@ def draw(stdscr, jobs, sel_l, scroll_l, filter_str,
         if fleet_only:
             hint = ("[tokens]  v window  Enter session tail  Tab zurück zum Detail"
                     if focus == "claude"
-                    else "j/k wählen  ↵ Fix mit Claude  Tab Tokens  l Log  R restart  a alle  / filter  q")
+                    else "j/k  ↵ Fix mit Claude  Tab Tokens  x an/aus  l Log  R restart  a alle  / filter  q")
         else:
             hint = ("[launchd] / filter  R restart  s stop  l/Enter tail  a Flotte"
                     if focus == "launchd"
@@ -1814,15 +1861,17 @@ def main(stdscr):
     # der Abweichung, der eine rote Punkt im ruhigen Bild ist die Botschaft.
     # bg bleibt Terminal-Default (heller Primär / dunkler Zwilling kommen vom
     # Terminal-Theme); die 256c-Indexe sind auf beiden lesbar gewählt.
+    # Dan-Override 2026-07-15: healthy ist GRÜN (weiches 65, k9s-Stil), denn
+    # grau bedeutet ab jetzt INAKTIV — Agenten sind per 'x' an-/abschaltbar,
+    # und ein grauer gesunder Agent sah aus wie ein abgeschalteter.
     if curses.COLORS >= 256:
-        curses.init_pair(1, 245, -1)   # ok/positive — gedimmt, nie grün
+        curses.init_pair(1, 65, -1)    # ok/healthy — weiches Grün
         curses.init_pair(2, 131, -1)   # fail — weiches Rot, nie #FF0000
         curses.init_pair(3, 136, -1)   # warn — Bernstein
         curses.init_pair(4, -1, -1)    # ink — Terminal-Default
-        curses.init_pair(5, 245, -1)   # meta/dim (healthy/transient-Glyphen)
+        curses.init_pair(5, 245, -1)   # dim — INAKTIV/disabled + transient
     else:
-        # 16c-Degrade: Semantik bleibt (rot/gelb), gesund bleibt stumm (default).
-        curses.init_pair(1, -1, -1)
+        curses.init_pair(1, curses.COLOR_GREEN, -1)
         curses.init_pair(2, curses.COLOR_RED, -1)
         curses.init_pair(3, curses.COLOR_YELLOW, -1)
         curses.init_pair(4, -1, -1)
@@ -1992,6 +2041,12 @@ def main(stdscr):
                 view = current_view()
                 if 0 <= sel_l < len(view):
                     status_msg = stop_job(view[sel_l])
+                    status_msg_until = tick + 4
+                    jobs = visible_jobs()
+            elif ch == ord('x'):
+                view = current_view()
+                if 0 <= sel_l < len(view) and is_fleet_agent(view[sel_l]["label"]):
+                    status_msg = toggle_agent(view[sel_l])
                     status_msg_until = tick + 4
                     jobs = visible_jobs()
             elif ch == ord('l'):
