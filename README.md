@@ -5,17 +5,37 @@ A terminal dashboard — `htop`-style — for the two things running quietly in 
 1. **Your background agents** — every scheduled/persistent job macOS runs for you via **launchd** (`~/Library/LaunchAgents`, `/Library/LaunchAgents`, `/Library/LaunchDaemons`).
 2. **Your Claude spend** — how many tokens Claude Code is burning, per model, per project, per session, plus your live Anthropic rate-limit budget.
 
-One screen, two panes, auto-refreshing every 2 seconds. Zero dependencies — pure Python 3 standard library (`curses` + `json`).
+One screen, master-detail, auto-refreshing every 2 seconds. Zero dependencies — pure Python 3 standard library (`curses` + `json`). It opens in **fleet mode**: your own agents, worst-first, with the selected agent's full state on the right — `↵` opens a fresh Claude Code session split right next to it, already seeded to fix that agent. `Tab` flips the right pane to the Claude/token view; `x` switches an agent on/off.
 
 ```
-┌ LAUNCHD  30 jobs (12 ok, 1 fail) ─────────┬ CLAUDE  window: 5h (v cycle) ──────────────┐
-│ ● com.user.backup        every 1h   ok    │ Anthropic limits (live from API headers)   │
-│ ⚠ com.user.sync          at load    exit 1│   5h    0% ███········· reset 4h 12m allowed │
-│ ○ com.user.reindex       Mon 03:00  idle  │   7d    5% █···········  reset 6d 1h allowed  │
-│ ...                                        │ Local activity (window: 5h)                │
-│                                            │   in 13.3M  out 107.6M  cache 53.3G         │
-│                                            │ By model / By project / Sessions / 24h chart│
-└────────────────────────────────────────────┴─────────────────────────────────────────────┘
+agenttop  dan · deine flotte                                   ⚡ 5h 288.9G · 3.7M/min
+──────────────────────────────────────────────┬───────────────────────────────────────
+ LAUNCHD  11 agents (7 ok, 1 fail)            │ openclaw-ui-watch
+  LABEL                  SCHEDULE     STATUS  │ ────────────────────────────────────
+ ▸✗ openclaw-ui-watch    Mon 02:00   failing  │ State    ✗ FAILING — braucht dich
+  ⚠ hausverwaltung-disc… * 01:00     stale    │ Schedule Mon 02:00
+  ↻ agent-script-audit   Mo/Mi/Fr/So recover… │ PID/Exit - / 1 · log 37K
+  ↻ coverage-audit       So/Mi 03:00 recover… │ Log      ~/Library/Logs/…ui-watch.log
+  ○ cso-audit            Di/Do 02:00 transie… │
+  ○ openclaw-upgrade-va… * 00:00     transie… │ Ursache  ERROR: claude exited 1
+  ● audit-health         Mon 08:00   healthy  │ Fix      Anthropic-Guthaben/Key
+  ● deploy-validate      * 01:00     healthy  │          prüfen; manuell laufen lassen
+  ● observer             Wed 03:00   healthy  │ ─ log tail ─────────────────────────
+  ● bridge               keep-alive  healthy  │ 01:00:41 ERROR: claude exited 1
+  ● tunnel               keep-alive  healthy  │ 01:00:41 You've reached your usage l…
+                                              │ ↵ Fix mit Claude  x an/aus  R restart
+──────────────────────────────────────────────┴───────────────────────────────────────
+ j/k  ↵ Fix mit Claude  Tab Tokens  x an/aus  l Log  a alle  q         ✗ 1 · ⚠ 1 · ● 9
+```
+
+Healthy rows render **soft green** (grey means deliberately switched OFF via `x`); the one failing agent is the only red thing on screen. `a` shows ALL launchd jobs plus the classic Claude pane:
+
+```
+┌ LAUNCHD  35 jobs ──────────────────────────┬ CLAUDE  window: 5h (v cycle) ─────────────┐
+│ ● com.houseclaw.tunnel   keep-alive  ok    │ Anthropic limits (live from API headers)  │
+│ ○ com.docker.helper      at load     idle  │   5h   12% ███········· reset 2h 41m      │
+│ …                                          │ By model / By project / Sessions / 24h    │
+└────────────────────────────────────────────┴────────────────────────────────────────────┘
 ```
 
 ---
