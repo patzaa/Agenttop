@@ -50,11 +50,37 @@ Lists every launch agent and daemon, with live status pulled from `launchctl lis
 
 | key | action |
 |-----|--------|
-| `Enter` | live-follow its log file (stdout + stderr), any key returns |
+| `Enter` | **fleet agent: open Claude Code on it** (herdr workspace, seeded prompt) · other jobs: tail log |
+| `l` | live-follow its log file (stdout + stderr), any key returns |
 | `R` | restart (`launchctl kickstart -k`) |
 | `s` | stop (`launchctl kill SIGTERM`) |
+| `a` | toggle fleet mode ↔ all launchd jobs |
 | `/` | filter by label (Enter applies, Esc cancels) · `c` clears |
 | `j`/`k` or `↓`/`↑` | move · `g`/`G` top/bottom |
+
+## Fleet mode (default) — your agents, master-detail
+
+agenttop starts in **fleet mode**: only the agents *you* built (label prefixes in
+`FLEET_PREFIXES` — `com.hausverwaltung.*`, `com.houseclaw.*`, `com.dan.*`), never
+Microsoft/Adobe/vendor helpers. The left pane lists them **worst-first** with a
+health state derived the way a watchdog would:
+
+- a silent skip exits 0, so `LastExitStatus` lies — the log tail's most recent
+  outcome line is what gets classified (`failing` / `blocked` / `stale` /
+  `recovering` / `transient` / `healthy`),
+- a dirty-tree block is re-checked against the repo *now* (clean again →
+  `recovering`, not a stale alarm),
+- a keep-alive service with a live PID is healthy no matter how quiet its log,
+- a log untouched for 14+ days means the job isn't firing, whatever it last said.
+
+The right pane is the **detail view** of the selected agent: state, schedule,
+cause, a concrete fix hint, and a live log tail. `Enter` opens **Claude Code in a
+fresh herdr workspace, already seeded** with that agent's plist, program, log and
+symptom — investigate and improve it in one keystroke. While agenttop is open, an
+agent flipping to failing/blocked fires a clickable macOS notification
+(`terminal-notifier`), same anti-silent-failure guard the Observer cron applies
+between its weekly runs. Claude spend stays visible as a compact `⚡` header badge;
+`a` brings back the classic two-pane view (all jobs + full Claude pane).
 
 > System daemons in `/Library/LaunchDaemons` need `sudo` to restart — agenttop tells you the exact command when permission is denied.
 
@@ -85,16 +111,17 @@ Reads your Claude Code session logs in `~/.claude/projects/**/*.jsonl` and aggre
 
 ---
 
-## Performance — the persistent index
+## Performance — the aggregated index (v2)
 
-The Claude pane parses your entire `~/.claude/projects` history (often hundreds of MB, millions of JSONL lines). Parsing that from scratch every launch takes minutes, so agenttop keeps a **persistent index cache**:
+The Claude pane parses your entire `~/.claude/projects` history (often hundreds of MB, millions of JSONL lines) — once. From then on it reads only appended bytes, and **stores no raw events at all**: no view ever displays a single event, everything is a windowed sum, and the finest resolution any view needs is one *minute* (the 24h chart plots peak tokens/min). So the index aggregates at ingest:
 
-- **First launch** parses everything once (~2–3 min on a large history) and writes `~/.cache/agenttop/index-cache.pkl`.
-- **Every launch after** reloads that cache and reads only the bytes appended since — **~2 seconds**.
-- Events older than **31 days** are dropped on save (no view looks back further), so memory and the cache stay bounded as history grows.
+- **minute grain** for the last 48h (5h window, today, 24h chart, session tails, burn rate),
+- **day + hour grain** for 31 days (7d window, daily history, the historic max-5h baseline).
+
+Measured on a heavy real-world history (~800k events/day): the v1 raw-event cache had grown to **1.4 GB / 17M tuples, 4s cold load, seconds per refresh tick**. v2 is **~9 MB, 156ms cold load, ~2ms per frame** — verified against the raw data (5h/today totals and the 24h peaks are bit-identical; the far edge of a rolling 7d window rounds to calendar days).
+
+- A v1 cache is migrated in place on first launch (no re-parse of the jsonl history).
 - The cache is rebuildable — delete it any time; it's regenerated on the next run. It also self-invalidates on a schema-version bump or corruption.
-
-> Heads up: on a large history the cache file can be a few hundred MB. It lives in `~/.cache/agenttop/` alongside the cached rate-limit headers.
 
 ## Command-line (non-interactive) modes
 
