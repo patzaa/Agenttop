@@ -71,7 +71,13 @@ LIMITS_TTL_SECONDS = 3600  # auto-refresh after 1h of staleness (≈1 msg/h whil
 # millions of lines) on every cold start. Parse once, reload in <1s thereafter.
 INDEX_CACHE = CACHE_DIR / "index-cache.pkl"
 INDEX_CACHE_VERSION = 1            # bump to invalidate cache on schema change
-EVENT_RETENTION_DAYS = 31         # drop events older than this; no view looks back further
+# 7, not 31: the raw event list is scanned on cold-load AND on every 2s refresh,
+# so its length is the dominant cost. At ~270k events/day, 31 days = 8.3M events =
+# a 727MB pickle and a 4s load (measured 2026-07-15). 7 days keeps the 5h/today/7d
+# windows, the 24h chart and session tails intact; only the historic max-5h
+# baseline shortens from 31d to 7d (see historic_max_5h). Cut here + a one-time
+# prune of the existing cache = ~4x smaller, sub-second load.
+EVENT_RETENTION_DAYS = 7          # drop events older than this; no view looks back further
 SAVE_INTERVAL_SECONDS = 120       # throttle on-disk index writes while running
 
 
@@ -882,7 +888,7 @@ class ClaudeIndex:
                     peaks[hi]["max_out"] = mi_out
         return peaks
 
-    def historic_max_5h(self, now: float, days: int = 30) -> tuple:
+    def historic_max_5h(self, now: float, days: int = EVENT_RETENTION_DAYS) -> tuple:
         """Sliding 5h window over last `days` days. Returns (max_in_out_tokens, end_ts).
         end_ts is the epoch second at which the busiest window ended.
         Excludes the currently-open 5h window (last 5h before `now`) so the bar
