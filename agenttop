@@ -38,6 +38,7 @@ import re
 import shutil
 import subprocess
 import sys
+import textwrap
 import threading
 import time
 from collections import defaultdict
@@ -315,6 +316,8 @@ def collect_jobs():
                 "color": color,
                 "log_path": plist.get("StandardOutPath") or plist.get("StandardErrorPath"),
                 "stderr_path": plist.get("StandardErrorPath"),
+                "program": " ".join(plist.get("ProgramArguments", [])) or plist.get("Program", ""),
+                "plist_path": str(p),
                 "location": loc.name,
                 "is_daemon": is_daemon,
             })
@@ -367,17 +370,27 @@ def stop_job(job):
 # that makes agenttop a hub: select an agent, press Enter, and Claude Code opens
 # in a fresh herdr workspace already seeded to investigate+improve THAT agent.
 
-FLEET_PREFIXES = ("com.hausverwaltung.",)  # extend with your own label prefixes
+# YOUR label prefixes — never vendor jobs. com.houseclaw.* are the product's
+# bridge/tunnel agents, com.dan.* the personal crons (found by audit 2026-07-15).
+FLEET_PREFIXES = ("com.hausverwaltung.", "com.houseclaw.", "com.dan.")
 
 # Health states, most-severe first (drives sort + colour).
 HEALTH_ORDER = ("failing", "blocked", "dead", "stale", "recovering", "transient", "healthy", "unknown")
+# Single-width glyphs on purpose: emoji are double-width in most terminals and
+# shear every column to their right in curses. Colour carries the severity.
 HEALTH_ICON = {
-    "failing": "🔴", "blocked": "🟠", "dead": "⚫", "stale": "🟡",
-    "recovering": "🟢", "transient": "🔵", "healthy": "✅", "unknown": "◽",
+    "failing": "✗", "blocked": "⚠", "dead": "✗", "stale": "⚠",
+    "recovering": "↻", "transient": "○", "healthy": "●", "unknown": "?",
 }
 HEALTH_COLOR = {  # curses colour-pair ids defined in main()
     "failing": 2, "blocked": 3, "dead": 2, "stale": 3,
     "recovering": 1, "transient": 5, "healthy": 1, "unknown": 4,
+}
+HEALTH_LABEL_DE = {
+    "failing": "FAILING — braucht dich", "blocked": "BLOCKED — skippt jeden Lauf",
+    "dead": "DEAD — nicht geladen", "stale": "STALE — überfällig",
+    "recovering": "recovering — klärt sich", "transient": "transient — harmlos",
+    "healthy": "healthy", "unknown": "unbekannt",
 }
 
 
@@ -419,8 +432,22 @@ def _log_tail(path: str, n: int = 60) -> list:
 def agent_health(job: dict) -> dict:
     """Classify one fleet agent: {state, symptom, fix}. A silent skip exits 0, so
     trust the log tail's most-recent outcome over LastExitStatus."""
+    # A keep-alive service that is running RIGHT NOW is healthy no matter how old
+    # its log is (bridge/tunnel write nothing for days when traffic is quiet).
+    if job["pid"] not in ("-", "", None):
+        return {"state": "healthy", "symptom": f"läuft (pid {job['pid']})", "fix": ""}
     if job["pid"] == "-" and job["exit"] == "-" and not job.get("log_path"):
         return {"state": "unknown", "symptom": "no launchctl/log signal", "fix": fix_hint("")}
+    # Not running and the log hasn't moved in ages → the job isn't firing at all,
+    # no matter what its last outcome line says. (Caught live: a discovery cron
+    # whose EMPTY log made it look healthy while it hadn't run in 41 days.)
+    try:
+        idle_d = (time.time() - os.path.getmtime(job["log_path"])) / 86400
+        if idle_d > 14:
+            sym = f"no run in {idle_d:.0f}d (log untouched)"
+            return {"state": "stale", "symptom": sym, "fix": fix_hint(sym)}
+    except (OSError, TypeError, ValueError):
+        pass
     tail = _log_tail(job.get("log_path"))
     outcome = ""
     for line in reversed(tail):
@@ -453,12 +480,15 @@ def launch_claude_on_agent(job: dict) -> str:
     label = job["label"]
     short = label.split(".")[-1]
     log = job.get("log_path") or ""
-    wrapper = str(Path.home() / ".local" / "bin" / f"hausverwaltung-{label.replace('com.hausverwaltung.','')}.sh")
+    # From the plist, not guessed from the label — com.houseclaw.* / com.dan.*
+    # agents don't follow the hausverwaltung-<short>.sh naming.
+    program = job.get("program") or "?"
     health = agent_health(job)
     prompt = (
         f"Du arbeitest an dem launchd-Agenten `{label}`. agenttop hat ihn als '{health['state']}' markiert.\n\n"
-        f"- Wrapper: {wrapper}\n- Log: {log}\n- Symptom: {health['symptom']}\n- Fix-Ansatz: {health['fix']}\n\n"
-        "Aufgabe: Log-Tail + Wrapper lesen, ECHTE Ursache finden (bei 'claude exited 1' den Agenten EINMAL manuell mit sichtbarem Output laufen lassen), "
+        f"- Programm: {program}\n- plist: {job.get('plist_path', '?')}\n- Log: {log}\n"
+        f"- Symptom: {health['symptom']}\n- Fix-Ansatz: {health['fix']}\n\n"
+        "Aufgabe: Log-Tail + das Programm-Skript lesen, ECHTE Ursache finden (bei 'claude exited 1' den Agenten EINMAL manuell mit sichtbarem Output laufen lassen), "
         "den Fix anwenden WENN eindeutig sicher, sonst vorschlagen. Am Ende 3 Sätze: Ursache, Fix (getan/vorgeschlagen), läuft der nächste Lauf durch. "
         "Fass keine anderen Agenten an."
     )
@@ -1572,20 +1602,84 @@ def tail_claude_session(stdscr, index: ClaudeIndex, sid: str, project: str):
 # ── main ────────────────────────────────────────────────────────────
 
 
+def draw_agent_detail_pane(stdscr, x0, y0, w, h, job):
+    """Master-Detail right pane: the FULL state of the selected fleet agent —
+    health, schedule, cause, fix, log tail — so pruefen-dann-verbessern is one
+    glance plus one Enter (which opens Claude Code seeded on this agent)."""
+    clamp = x0 + w
+    health = job.get("health") or agent_health(job)
+    state = health["state"]
+    short = job["label"].replace("com.hausverwaltung.", "")
+    cpair = curses.color_pair(HEALTH_COLOR.get(state, 4))
+
+    safe_addstr(stdscr, y0, x0, f" {short}", curses.A_BOLD, clamp)
+    safe_addstr(stdscr, y0 + 1, x0, " " + "─" * (w - 2), curses.A_DIM, clamp)
+
+    def field(row, label, value, attr=0):
+        safe_addstr(stdscr, row, x0, f" {label:<9}", curses.A_DIM, clamp)
+        safe_addstr(stdscr, row, x0 + 10, value[: w - 11], attr, clamp)
+
+    y = y0 + 2
+    field(y, "State", f"{HEALTH_ICON[state]} {HEALTH_LABEL_DE[state]}", cpair | curses.A_BOLD); y += 1
+    field(y, "Schedule", job["schedule"]); y += 1
+    field(y, "PID/Exit", f"{job['pid']} / {job['exit']}   log {human_size(job['log_size'])}"); y += 1
+    log_p = job.get("log_path") or "—"
+    field(y, "Log", log_p.replace(str(Path.home()), "~")); y += 1
+
+    def wrapped(row, label, text, attr=0, max_lines=3):
+        lines = textwrap.wrap(text, max(10, w - 12)) or ["—"]
+        for i, ln in enumerate(lines[:max_lines]):
+            safe_addstr(stdscr, row + i, x0, f" {label if i == 0 else '':<9}", curses.A_DIM, clamp)
+            safe_addstr(stdscr, row + i, x0 + 10, ln, attr, clamp)
+        return row + min(len(lines), max_lines)
+
+    y += 1
+    y = wrapped(y, "Ursache", health["symptom"], cpair)
+    if health["fix"]:
+        y = wrapped(y, "Fix", health["fix"], curses.color_pair(3))
+
+    # log tail fills the rest, minus the action bar
+    tail_top = y + 1
+    tail_h = (y0 + h) - tail_top - 1
+    if tail_h > 1:
+        safe_addstr(stdscr, tail_top, x0, " ─ log tail " + "─" * max(0, w - 13), curses.A_DIM, clamp)
+        lines = _log_tail(job.get("log_path"), tail_h - 1)
+        for i, ln in enumerate(lines[-(tail_h - 1):]):
+            attr = curses.color_pair(2) if re.search(r"ERROR|FAIL", ln) else curses.A_DIM
+            safe_addstr(stdscr, tail_top + 1 + i, x0, " " + ln[: w - 2], attr, clamp)
+    if is_fleet_agent(job["label"]):
+        bar = " ↵ Fix mit Claude   R restart   l Log   a alle Jobs"
+        safe_addstr(stdscr, y0 + h - 1, x0, bar[: w - 1], curses.A_BOLD, clamp)
+
+
+def _claude_badge(index, limits, now) -> str:
+    """One-line spend summary for the header while the right pane shows agent
+    detail (v2 made these queries ~2ms, so per-frame is fine)."""
+    five_h = index.aggregate(since=now - 5 * 3600)["totals"]
+    burn = index.recent_burn(now)
+    badge = f"⚡ 5h {_fmt_tokens(total_tokens(five_h))}"
+    if burn >= 1:
+        badge += f" · {_fmt_tokens(int(burn))}/min"
+    return badge
+
+
 def draw(stdscr, jobs, sel_l, scroll_l, filter_str,
-         index, limits, sel_c, window_mode, focus, status_msg=""):
+         index, limits, sel_c, window_mode, focus, status_msg="",
+         fleet_only=False):
     stdscr.erase()
     h, w = stdscr.getmaxyx()
     user = getpass.getuser()
 
     # Top header
     title = "agenttop"
-    info = f"  {user}   "
-    keys = "Tab focus  q quit  r refresh  f fetch"
+    info = f"  {user} · {'deine Flotte' if fleet_only else 'alle launchd-Jobs'}   "
+    keys = (_claude_badge(index, limits, time.time()) if fleet_only
+            else "Tab focus  q quit  r refresh  f fetch")
     safe_addstr(stdscr, 0, 0, title, curses.A_BOLD, w)
     safe_addstr(stdscr, 0, len(title), info, curses.A_DIM, w)
     if w > len(title) + len(info) + len(keys) + 3:
-        safe_addstr(stdscr, 0, w - len(keys) - 1, keys, curses.A_DIM, w)
+        safe_addstr(stdscr, 0, w - len(keys) - 1, keys,
+                    curses.A_BOLD if fleet_only else curses.A_DIM, w)
 
     launchd_w, claude_w = _split_widths(w)
     body_top = 1
@@ -1610,10 +1704,17 @@ def draw(stdscr, jobs, sel_l, scroll_l, filter_str,
         )
         for y in range(body_top, body_top + body_h):
             safe_addstr(stdscr, y, launchd_w, "│", curses.A_DIM, w)
-        sel_c, sessions_list = draw_claude_pane(
-            stdscr, launchd_w + 1, body_top, claude_w, body_h, index,
-            limits, window_mode, sel_c, focused=(focus == "claude"),
-        )
+        if fleet_only and _filtered:
+            sel_safe = min(sel_l, len(_filtered) - 1)
+            draw_agent_detail_pane(
+                stdscr, launchd_w + 1, body_top, claude_w, body_h,
+                _filtered[sel_safe],
+            )
+        else:
+            sel_c, sessions_list = draw_claude_pane(
+                stdscr, launchd_w + 1, body_top, claude_w, body_h, index,
+                limits, window_mode, sel_c, focused=(focus == "claude"),
+            )
 
     # Footer
     footer_y = h - 1
@@ -1625,9 +1726,12 @@ def draw(stdscr, jobs, sel_l, scroll_l, filter_str,
         safe_addstr(stdscr, footer_y, 0,
                     f"filter: /{filter_str}    (c to clear)", curses.A_DIM, w)
     else:
-        hint = ("[launchd] / filter  R restart  s stop  Enter tail"
-                if focus == "launchd"
-                else "[claude]  v window  f fetch limits  Enter session tail")
+        if fleet_only:
+            hint = "j/k wählen  ↵ Fix mit Claude  l Log  R restart  a alle Jobs  / filter  q quit"
+        else:
+            hint = ("[launchd] / filter  R restart  s stop  l/Enter tail  a Flotte"
+                    if focus == "launchd"
+                    else "[claude]  v window  f fetch limits  Enter session tail")
         safe_addstr(stdscr, footer_y, 0, hint, curses.A_DIM, w)
 
     stdscr.refresh()
@@ -1665,7 +1769,40 @@ def main(stdscr):
 
     def visible_jobs():
         js = collect_jobs()
-        return [j for j in js if is_fleet_agent(j["label"])] if fleet_only else js
+        if not fleet_only:
+            return js
+        js = [j for j in js if is_fleet_agent(j["label"])]
+        for j in js:
+            h_ = agent_health(j)
+            j["health"] = h_
+            j["icon"] = HEALTH_ICON[h_["state"]]
+            j["color"] = HEALTH_COLOR[h_["state"]]
+            j["status_text"] = h_["state"]
+        # worst first — the thing that needs you is always at the top
+        js.sort(key=lambda j: (HEALTH_ORDER.index(j["health"]["state"]), j["label"]))
+        return js
+
+    prev_states: dict = {}
+
+    def notify_worsened(js):
+        """While agenttop is open, a fleet agent flipping to failing/blocked/dead
+        fires a click-to-investigate notification — same anti-'unnoticed' guard
+        the Observer applies between its Wednesday runs."""
+        bad = ("failing", "blocked", "dead")
+        for j in js:
+            state = (j.get("health") or {}).get("state")
+            prev = prev_states.get(j["label"])
+            prev_states[j["label"]] = state
+            if state in bad and prev is not None and prev not in bad:
+                if shutil.which("terminal-notifier"):
+                    short = j["label"].replace("com.hausverwaltung.", "")
+                    subprocess.Popen([
+                        "terminal-notifier",
+                        "-title", f"agenttop: {short} → {state.upper()}",
+                        "-message", (j["health"].get("fix") or "")[:120],
+                        "-execute", str(Path.home() / ".local" / "bin" / "hausverwaltung-observer-investigate.sh") + " " + j["label"],
+                        "-group", "agenttop-health",
+                    ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     jobs = visible_jobs()
     sel_l = 0
@@ -1685,6 +1822,7 @@ def main(stdscr):
         scroll_l, sel_l, sel_c, sessions_list = draw(
             stdscr, jobs, sel_l, scroll_l, filter_str,
             index, limits, sel_c, window_mode, focus, status_msg,
+            fleet_only=fleet_only,
         )
         ch = stdscr.getch()
         tick += 1
@@ -1692,6 +1830,8 @@ def main(stdscr):
             status_msg = ""
         if ch == -1:
             jobs = visible_jobs()
+            if fleet_only:
+                notify_worsened(jobs)
             added = index.refresh()
             if limits.is_stale():
                 limits.fetch_async()
@@ -1718,6 +1858,12 @@ def main(stdscr):
             index.save()
             break
         if ch == 9:  # Tab
+            if fleet_only:
+                # fleet mode has no second focusable pane (the right side IS the
+                # selected agent) — the full claude pane lives behind 'a'
+                status_msg = "Claude-Pane: erst 'a' (alle Jobs), dann Tab"
+                status_msg_until = tick + 3
+                continue
             focus = "claude" if focus == "launchd" else "launchd"
             continue
         if ch == ord('r'):
