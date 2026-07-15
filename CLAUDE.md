@@ -12,9 +12,10 @@ All color tokens (curses pairs + 256c indexes), glyphs, weight hierarchy, spacin
 and aesthetic direction are defined there. Do not deviate without explicit user
 approval. In QA mode, flag any code that doesn't match DESIGN.md.
 
-Kernregeln in Kürze: Zustand = Glyph+Farbe+Text (nie Farbe allein) · single-width-
-Glyphen, nie Emoji (double-width schert Spalten) · ok-Farbe nur an Glyphen ·
-Farbbudget gehört der Abweichung („Ruhe — nichts schreit") · bg = Terminal-Default.
+Kernregeln in Kürze (B2 „Papier"): Zustand = Glyph+Farbe+Text (nie Farbe allein) ·
+single-width-Glyphen, nie Emoji (double-width schert Spalten) · GESUND IST STUMM
+(dim, kein Grün) · nur zwei Chroma: fail-Rot + warn-Bernstein · Fokus = bold,
+nicht Farbe · bg = Terminal-Default.
 
 ## Arbeiten am Code
 - Pure-Logik headless testen: `python3 -c "from importlib.machinery import

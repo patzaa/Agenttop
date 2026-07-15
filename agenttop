@@ -383,8 +383,10 @@ HEALTH_ICON = {
     "recovering": "↻", "transient": "○", "healthy": "●", "unknown": "?",
 }
 HEALTH_COLOR = {  # curses colour-pair ids defined in main()
+    # B2 „Papier": nur die Abweichung bekommt Farbe. healthy/recovering/transient
+    # sind gedimmte Glyphen (pair 5) — gesund ist stumm, nie grün.
     "failing": 2, "blocked": 3, "dead": 2, "stale": 3,
-    "recovering": 1, "transient": 5, "healthy": 1, "unknown": 4,
+    "recovering": 5, "transient": 5, "healthy": 5, "unknown": 4,
 }
 HEALTH_LABEL_DE = {
     "failing": "FAILING — braucht dich", "blocked": "BLOCKED — skippt jeden Lauf",
@@ -1116,7 +1118,8 @@ def draw_launchd_pane(stdscr, x0, y0, w, h, all_jobs, selected, scroll,
     failed = sum(1 for j in jobs if j["exit"] not in ("-", "0", ""))
 
     # Title
-    title_attr = curses.A_BOLD | (curses.color_pair(5) if focused else 0)
+    # B2: Fokus traegt das GEWICHT, nicht die Farbe — unfokussiert wird gedimmt.
+    title_attr = curses.A_BOLD if focused else (curses.A_BOLD | curses.A_DIM)
     title = "LAUNCHD"
     info = f"  {len(jobs)} jobs ({running} ok, {failed} fail)"
     safe_addstr(stdscr, y0, x0, title, title_attr, x0 + w)
@@ -1186,7 +1189,8 @@ def draw_claude_pane(stdscr, x0, y0, w, h, index: ClaudeIndex,
     since, until, label = window_bounds(window_mode, now)
     agg = index.aggregate(since=since, until=until)
 
-    title_attr = curses.A_BOLD | (curses.color_pair(5) if focused else 0)
+    # B2: Fokus traegt das GEWICHT, nicht die Farbe — unfokussiert wird gedimmt.
+    title_attr = curses.A_BOLD if focused else (curses.A_BOLD | curses.A_DIM)
     safe_addstr(stdscr, y0, x0, "CLAUDE", title_attr, x0 + w)
     safe_addstr(stdscr, y0, x0 + 6, f"  window: {label}  (v cycle)", 0, x0 + w)
 
@@ -1742,11 +1746,24 @@ def main(stdscr):
     curses.curs_set(0)
     curses.start_color()
     curses.use_default_colors()
-    curses.init_pair(1, curses.COLOR_GREEN, -1)    # ok / running
-    curses.init_pair(2, curses.COLOR_RED, -1)      # error
-    curses.init_pair(3, curses.COLOR_YELLOW, -1)   # warning
-    curses.init_pair(4, -1, -1)                    # idle
-    curses.init_pair(5, curses.COLOR_CYAN, -1)     # focused pane title
+    # DESIGN.md — B2 „Papier" (Notion im Terminal): Farbe existiert nur, wo etwas
+    # dich braucht. Gesund ist STUMM — bewusst kein Grün: das Farbbudget gehört
+    # der Abweichung, der eine rote Punkt im ruhigen Bild ist die Botschaft.
+    # bg bleibt Terminal-Default (heller Primär / dunkler Zwilling kommen vom
+    # Terminal-Theme); die 256c-Indexe sind auf beiden lesbar gewählt.
+    if curses.COLORS >= 256:
+        curses.init_pair(1, 245, -1)   # ok/positive — gedimmt, nie grün
+        curses.init_pair(2, 131, -1)   # fail — weiches Rot, nie #FF0000
+        curses.init_pair(3, 136, -1)   # warn — Bernstein
+        curses.init_pair(4, -1, -1)    # ink — Terminal-Default
+        curses.init_pair(5, 245, -1)   # meta/dim (healthy/transient-Glyphen)
+    else:
+        # 16c-Degrade: Semantik bleibt (rot/gelb), gesund bleibt stumm (default).
+        curses.init_pair(1, -1, -1)
+        curses.init_pair(2, curses.COLOR_RED, -1)
+        curses.init_pair(3, curses.COLOR_YELLOW, -1)
+        curses.init_pair(4, -1, -1)
+        curses.init_pair(5, -1, -1)
 
     stdscr.timeout(2000)
 

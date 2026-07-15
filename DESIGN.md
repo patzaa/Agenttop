@@ -1,8 +1,9 @@
 # Design System — agenttop
 
-Gewählt am 2026-07-15 via /design-consultation: 2 Runden Vergleichs-Board
+Gewählt am 2026-07-15 via /design-consultation, 2 Runden Vergleichs-Board
 (Runde 1: Stille Konsole / Werkbank / Phosphor → „more like B, white background";
-Runde 2: drei helle B-Riffs → **B1 · Werkbank Hell**).
+Runde 2: drei helle B-Riffs). Erst B1 festgeschrieben, dann auf Dans Zuruf
+revidiert auf **B2 · Papier — „Notion im Terminal"**.
 Mockups + approved.json: `~/.gstack/projects/patzaa-Agenttop/designs/design-system-20260715/`
 
 ## Product Context
@@ -13,47 +14,44 @@ Mockups + approved.json: `~/.gstack/projects/patzaa-Agenttop/designs/design-syst
 
 ## Merksatz (jede Entscheidung dient diesem Satz)
 **„Ruhe — nichts schreit."** Der eine kranke Agent trägt das Bild; alles Gesunde
-tritt zurück. Farbe ist ein Budget, das der ABWEICHUNG gehört.
+tritt zurück. Farbe ist ein Budget, das ausschließlich der ABWEICHUNG gehört.
 
 ## Aesthetic Direction
-- **Direction:** Industrial/Utilitarian, hell („Werkbank Hell") — k9s-Disziplin auf Papier.
+- **Direction:** B2 · Papier — Notion im Terminal. Warmes Weiß, near-monochrome,
+  Farbe nur für „braucht dich".
 - **Decoration level:** minimal — das Zeichenraster ist die Dekoration.
-- **Mood:** aufgeräumte Werkbank; professionell, still, sofort lesbar.
+- **Mood:** ein ruhiges Blatt Papier, auf dem genau eine Stelle rot angestrichen ist.
 
 ## Farbe (der Kern — alles andere folgt)
-**Ansatz:** restrained. Farbe existiert an genau zwei Orten: Semantik-Glyphen/-Wörtern
-und der EINEN Strukturfarbe. Fließtext bleibt achromatisch (die k9s-Lektion:
-„Primärfarbe für 1–2 Dinge, Rest achromatisch").
+**Ansatz:** restrained, radikaler als Werkbank: **kein Grün, keine Strukturfarbe.**
+Gesund/erholend/transient sind gedimmte Glyphen. Es gibt genau zwei Chroma:
+fail-Rot und warn-Bernstein — beide gedämpft (nie #FF0000, „sieht billig aus").
 
-Der Hintergrund ist IMMER das Terminal-Default (`use_default_colors`) — das Design
-definiert deshalb ZWEI Paletten derselben Familie; der Zwilling greift auf dunklen
-Terminals (Erkennung: nicht nötig — Truecolor-Werte sind Zielwerte fürs Terminal-Theme,
-curses nutzt die 256c-Indexe, die auf beiden lesbar gewählt sind, Auswahl per
-Terminal-Theme des Nutzers):
+Der Hintergrund ist IMMER das Terminal-Default (`use_default_colors`). Zielwerte
+fürs Terminal-Theme (hell primär, dunkler Zwilling = dieselbe These auf dunkel);
+curses selbst nutzt die 256c-Indexe, die auf BEIDEN lesbar gewählt sind:
 
 | Token | hell (primär) | dunkel (Zwilling) | 256c | 16c-Degrade | Verwendung |
 |---|---|---|---|---|---|
-| ink | `#2E3338` | `#C6CCD2` | 236 / 251 | default fg | 80 % des Inhalts |
-| dim | `#8A9099` | `#707880` | 245 | bright-black | Metadaten, Schedule, Hints |
-| faint | `#C6CBD1` | `#3B444F` | 251 / 238 | bright-black | Trennlinien, Log-Rauschen |
-| accent | `#3E6E96` | `#7AA2C7` | 24 / 67 | blue | Panel-Titel, ⚡-Badge, Selektionskante `▌` |
-| fail | `#C0453E` | `#E88388` | 131 | red | ✗ + FAILING/BLOCKED (+bold) |
-| warn | `#A8752A` | `#ECC48D` | 136 | yellow | ⚠ + stale, Fix-Zeile |
-| ok | `#4F7D3C` | `#A8CC8C` | 65 | green | ● ↻ Glyphen — NUR Glyphen, nie Text |
-| sel-bg | `#E8EEF4` | `#1B2430` | 254 / 234 | reverse | Selektionsband |
+| ink | `#40403C` | `#B8B8B8` | default fg | default | 80 % des Inhalts |
+| dim | `#98968E` | `#6E6E6E` | 245 | default (stumm!) | Metadaten, Hints, gesunde Glyphen |
+| faint | `#D4D2C8` | `#4A4A4A` | 250 | bright-black | Trennlinien, Log-Rauschen |
+| fail | `#B5433C` | `#E88388` | 131 | red | ✗ + FAILING/BLOCKED (+bold) |
+| warn | `#9C7226` | `#D7BA7D` | 136 | yellow | ⚠ + stale, Fix-Zeile |
+| sel | `#F0EEE6`-Band | `#1F1F1F`-Band | A_REVERSE | A_REVERSE | Selektion (Terminal-ehrlich) |
 
 Regeln:
+- **Gesund ist stumm.** healthy/recovering/transient = gedimmte Glyphen (`● ↻ ○`),
+  nie grün — Grün wäre immer noch ein Farb-Schrei. Der Verzicht ist die These.
 - Zustand trägt IMMER Glyph + Farbe + Textwort — nie Farbe allein (16-Farben- und
-  Farbfehlsicht-fest). Glyphen single-width: `✗ ⚠ ↻ ○ ● ?` — nie Emoji (double-width
-  schert Spalten).
-- `ok`-Farbe nur am Glyphen; die Zeile selbst bleibt ink/dim. Gesund darf grün
-  blinken, aber nicht grün REDEN.
-- Rot/bold ist FAILING vorbehalten. Kommt Rot ins Bild, ist es die Nachricht.
+  Farbfehlsicht-fest). Glyphen single-width: `✗ ⚠ ↻ ○ ● ?` — nie Emoji.
+- Rot/bold ist FAILING/DEAD vorbehalten. Kommt Rot ins Bild, ist es die Nachricht.
+- Fokus trägt das GEWICHT (bold vs. dim), nicht die Farbe.
 
 ## Typografie (im Terminal = Gewichts-Disziplin, keine Fontwahl)
 - **Font:** der des Nutzers (Terminal-Monospace). Das Design schreibt keinen vor.
-- **Hierarchie:** bold = Programmname, Panel-Gegenstand, Aktions-Primärtaste ·
-  normal = Inhalt · dim = Metadaten/Hints · bold+Farbe = Zustandswörter.
+- **Hierarchie:** bold = Programmname, fokussierter Panel-Titel, Aktions-Primärtaste ·
+  normal = Inhalt · dim = Metadaten/Hints/gesunde Glyphen · bold+Farbe = Zustandswörter.
 - Niemals underline/italic/blink (Terminal-Lotterie).
 
 ## Spacing (das Zeichenraster)
@@ -66,7 +64,8 @@ Regeln:
 - Master-Detail, feste Positionen (räumliches Gedächtnis = Navigation): links
   Flotte worst-first, rechts Detail (State/Schedule/Ursache/Fix/Log-Tail/Aktionen).
 - Statuszeile: links Tasten (max. 5), rechts Zähler (`✗ 1 · ⚠ 1 · ● 9`).
-- Selektion: sel-bg-Band + `▌`-Kante in accent, Zustandsfarben bleiben sichtbar.
+- Selektion: A_REVERSE (auf jedem Terminal-Theme korrekt); Zustandsfarbe der
+  Zeile bleibt am Glyph erkennbar.
 - < 130 Spalten: einspaltig, Detail per Enter (bestehendes Verhalten).
 
 ## Motion
@@ -76,7 +75,9 @@ Regeln:
 ## Decisions Log
 | Date | Decision | Rationale |
 |------|----------|-----------|
-| 2026-07-15 | B1 „Werkbank Hell" gewählt (2 Board-Runden) | „more like B + white background is usually my default"; Merksatz „Ruhe — nichts schreit" |
-| 2026-07-15 | ok-Farbe nur an Glyphen, nie an Text | Farbbudget gehört der Abweichung; k9s-Restraint |
+| 2026-07-15 | B1 „Werkbank Hell" gewählt (2 Board-Runden) | „more like B + white background is usually my default" |
+| 2026-07-15 | **Revision: B1 → B2 „Papier"** (Dans Zuruf „use design B the notion for terminal") | Notion-These konsequent: kein Grün, keine Strukturfarbe — reinste Form des Merksatzes |
+| 2026-07-15 | ok-Zustände ganz ohne Chroma (dim statt grün) | Farbbudget gehört der Abweichung; Grün wäre noch ein Schrei |
+| 2026-07-15 | Fokus = Gewicht (bold/dim), nicht Farbe | Cyan-Titel widersprach der These; Gewicht ist terminal-ehrlich |
+| 2026-07-15 | Selektion = A_REVERSE statt Theme-Band | bg ist Terminal-Default — ein festes Band bricht auf dem jeweils anderen Theme |
 | 2026-07-15 | Kein Emoji, nur single-width-Glyphen | double-width schert curses-Spalten (live erlebt) |
-| 2026-07-15 | Heller Primär + dunkler Zwilling derselben Familie | bg ist Terminal-Default; beide Themes teilen Struktur + Glyphen |
