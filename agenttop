@@ -526,8 +526,25 @@ def launch_claude_on_agent(job: dict) -> str:
         else str(Path.home()))
     # Unique per press — every Enter is a FRESH session by design.
     name = f"fix-{short}-{time.strftime('%H%M%S')}"
+
+    # Inside herdr, agenttop knows its own tab (HERDR_TAB_ID is set in every
+    # pane): split RIGHT next to this very session — agenttop stays visible on
+    # the left, Claude works beside it. Anchor to OUR tab explicitly; splitting
+    # relative to the focused pane would land in whatever tab the user switched
+    # to. Outside herdr, fall back to a fresh dedicated workspace.
+    own_tab = os.environ.get("HERDR_TAB_ID", "")
     wsid = ""
     try:
+        if own_tab:
+            start = subprocess.run(["herdr", "agent", "start", name, "--tab", own_tab,
+                                    "--split", "right", "--focus", "--cwd", workdir,
+                                    "--", "claude", prompt],
+                                   capture_output=True, text=True, timeout=20)
+            err = herdr_error(start.stdout)
+            if start.returncode != 0 or err:
+                return fallback(f"herdr split: {err or 'exit ' + str(start.returncode)}")
+            return f"Claude ({name}) öffnet rechts daneben …"
+
         ws = subprocess.run(["herdr", "workspace", "create", "--cwd", workdir,
                              "--label", f"🔭 {short}", "--focus"],
                             capture_output=True, text=True, timeout=15)
