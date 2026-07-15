@@ -70,14 +70,18 @@ LIMITS_TTL_SECONDS = 3600  # auto-refresh after 1h of staleness (≈1 msg/h whil
 # Persistent event index — avoids re-parsing all of ~/.claude/projects (590MB+,
 # millions of lines) on every cold start. Parse once, reload in <1s thereafter.
 INDEX_CACHE = CACHE_DIR / "index-cache.pkl"
-INDEX_CACHE_VERSION = 1            # bump to invalidate cache on schema change
-# 7, not 31: the raw event list is scanned on cold-load AND on every 2s refresh,
-# so its length is the dominant cost. At ~270k events/day, 31 days = 8.3M events =
-# a 727MB pickle and a 4s load (measured 2026-07-15). 7 days keeps the 5h/today/7d
-# windows, the 24h chart and session tails intact; only the historic max-5h
-# baseline shortens from 31d to 7d (see historic_max_5h). Cut here + a one-time
-# prune of the existing cache = ~4x smaller, sub-second load.
-EVENT_RETENTION_DAYS = 7          # drop events older than this; no view looks back further
+INDEX_CACHE_VERSION = 2            # bump to invalidate cache on schema change
+# v2 stores NO raw events. Measured 2026-07-15: the v1 raw-event list had grown to
+# 17M tuples / 1.4GB pickle (at ~800k events/day), scanned on cold-load (4s) AND on
+# every 2s refresh — the whole "agenttop is slow" complaint. But no view ever shows
+# a single event: everything is a windowed SUM, and the finest resolution any view
+# needs is one MINUTE (the 24h chart plots peak tokens/min). So the index buckets
+# at ingest: minute-grain for the recent tail, day-grain beyond. ~50k rows instead
+# of millions; the honest cost is window edges quantised to <=60s and the historic
+# max-5h baseline to hour grain — invisible on a dashboard. Aggregates are so small
+# that the history horizon goes back UP to 31 days.
+AGG_RETENTION_DAYS = 31           # daily/hourly aggregate horizon (tiny rows)
+MINUTE_TAIL_HOURS = 48            # minute-grain window; every fine view lives inside it
 SAVE_INTERVAL_SECONDS = 120       # throttle on-disk index writes while running
 
 
@@ -603,72 +607,144 @@ def _bar(frac: float, width: int) -> str:
 
 
 class ClaudeIndex:
-    """Incremental scan of ~/.claude/projects/**/*.jsonl.
+    """Incremental scan of ~/.claude/projects/**/*.jsonl — aggregated at ingest.
 
-    On refresh(): re-stats every file, only reads newly-appended bytes.
-    Events stay in memory as flat tuples — small (~64 bytes each), so 100k+
-    events fit easily.
+    On refresh(): re-stats every file, only reads newly-appended bytes. Parsed
+    usage is bucketed immediately (v2): minute-grain for the last
+    MINUTE_TAIL_HOURS, folded to day/hour grain beyond. No raw events are kept —
+    no view ever displays one, and the raw list is what grew to 17M tuples /
+    1.4GB and made both cold start and every 2s refresh slow.
     """
 
-    # Event tuple positions
+    # Event tuple positions (session_events still emits this shape for the
+    # live-tail renderer — one tuple per MINUTE bucket there, not per event).
     TS, PROJECT, SID, MODEL, IN, OUT, CC, CR = range(8)
 
     def __init__(self, root: Path = None):
         self.root = root or CLAUDE_DIR
-        self.files: dict = {}     # path -> {pos, project}
-        self.events: list = []    # (ts, project, sid, model, in, out, cc, cr)
+        self.files: dict = {}         # path -> {pos, project}
+        # minute-grain tail: (minute_ts, sid, model) -> [in, out, cc, cr, msgs]
+        self.minutes: dict = {}
+        # folded history: (day_iso, project, model) -> [in, out, cc, cr, msgs]
+        self.daily: dict = {}
+        # folded per-session history: (day_iso, sid) -> [in, out, cc, cr, msgs]
+        self.session_daily: dict = {}
+        # folded hour-grain in+out (for the historic max-5h baseline): hour_ts -> int
+        self.hourly_io: dict = {}
+        self.fold_ts: float = 0.0     # minutes older than this have been folded
         self.project_names: dict = {}  # project_dir -> display name
         # Per-session side data (latest seen). Updated as new events parse.
         self.session_meta: dict = {}   # sid -> {branch, cwd, project, model, last_ts}
         self.errors: int = 0      # count of malformed lines
         self._load_index()
 
+    def _bucket(self, ts, sid, model, in_, out, cc, cr):
+        key = (int(ts // 60) * 60, sid, model)
+        b = self.minutes.get(key)
+        if b is None:
+            self.minutes[key] = [in_, out, cc, cr, 1]
+        else:
+            b[0] += in_
+            b[1] += out
+            b[2] += cc
+            b[3] += cr
+            b[4] += 1
+
     def _load_index(self):
         """Restore the parsed index from disk, if present and current.
 
-        On success, refresh() resumes from each file's saved byte offset and
-        only reads appended data — a cold start drops from ~minutes to <1s.
-        Any error (missing/corrupt cache, version bump) silently falls back to
-        an empty index, forcing a one-time full rescan.
+        v2 loads natively. A v1 cache (raw event list) is MIGRATED in place —
+        every event is bucketed, then folded — so the upgrade never pays the
+        full ~minutes-long jsonl rescan; byte offsets carry over.
+        Any other mismatch silently falls back to an empty index (one-time
+        full rescan).
         """
         try:
             with open(INDEX_CACHE, "rb") as f:
                 blob = pickle.load(f)
         except (OSError, pickle.UnpicklingError, EOFError, ValueError):
             return
-        if not isinstance(blob, dict) or blob.get("version") != INDEX_CACHE_VERSION:
+        if not isinstance(blob, dict):
             return
+        version = blob.get("version")
         try:
-            self.files = {Path(k): v for k, v in blob["files"].items()}
-            self.events = blob["events"]
-            self.project_names = {Path(k): v for k, v in blob["project_names"].items()}
-            self.session_meta = blob["session_meta"]
-            self.errors = blob.get("errors", 0)
-        except (KeyError, TypeError, AttributeError):
-            self.files, self.events = {}, []
+            if version == INDEX_CACHE_VERSION:
+                self.files = {Path(k): v for k, v in blob["files"].items()}
+                self.minutes = blob["minutes"]
+                self.daily = blob["daily"]
+                self.session_daily = blob["session_daily"]
+                self.hourly_io = blob["hourly_io"]
+                self.fold_ts = blob.get("fold_ts", 0.0)
+                self.project_names = {Path(k): v for k, v in blob["project_names"].items()}
+                self.session_meta = blob["session_meta"]
+                self.errors = blob.get("errors", 0)
+            elif version == 1 and "events" in blob:
+                self.files = {Path(k): v for k, v in blob["files"].items()}
+                self.project_names = {Path(k): v for k, v in blob["project_names"].items()}
+                self.session_meta = blob["session_meta"]
+                self.errors = blob.get("errors", 0)
+                for e in blob["events"]:
+                    # v1 tuple: (ts, project, sid, model, in, out, cc, cr)
+                    self._bucket(e[0], e[2], e[3], e[4], e[5], e[6], e[7])
+                self.prune()   # fold everything older than the minute tail
+        except (KeyError, TypeError, AttributeError, IndexError):
+            self.files, self.minutes = {}, {}
+            self.daily, self.session_daily, self.hourly_io = {}, {}, {}
+            self.fold_ts = 0.0
             self.project_names, self.session_meta, self.errors = {}, {}, 0
 
-    def prune(self, now: float = None, days: int = EVENT_RETENTION_DAYS):
-        """Drop in-memory events older than the retention window.
+    def _session_project(self, sid: str) -> str:
+        meta = self.session_meta.get(sid)
+        return meta["project"] if meta and meta.get("project") else "?"
 
-        File offsets are left untouched, so pruned-away history is never
-        re-read — it's simply outside every view's lookback. Keeps both memory
-        and the on-disk cache bounded as history grows.
+    def prune(self, now: float = None, days: int = AGG_RETENTION_DAYS):
+        """Fold minute buckets older than the tail into day/hour aggregates,
+        then drop aggregates beyond the retention horizon.
+
+        File offsets are left untouched, so folded-away detail is never
+        re-read. This is what keeps both memory and the on-disk cache bounded
+        no matter how much Claude runs.
         """
         now = now if now is not None else time.time()
-        cutoff = now - days * 86400
-        if self.events:
-            self.events = [e for e in self.events if e[self.TS] >= cutoff]
+        cutoff = now - MINUTE_TAIL_HOURS * 3600
+        if cutoff > self.fold_ts:
+            self.fold_ts = cutoff
+        old_keys = [k for k in self.minutes if k[0] < cutoff]
+        for key in old_keys:
+            m_ts, sid, model = key
+            in_, out, cc, cr, msgs = self.minutes.pop(key)
+            day = datetime.fromtimestamp(m_ts).date().isoformat()
+            project = self._session_project(sid)
+            for store, skey in ((self.daily, (day, project, model)),
+                                (self.session_daily, (day, sid))):
+                b = store.get(skey)
+                if b is None:
+                    store[skey] = [in_, out, cc, cr, msgs]
+                else:
+                    b[0] += in_; b[1] += out; b[2] += cc; b[3] += cr; b[4] += msgs
+            h_ts = int(m_ts // 3600) * 3600
+            self.hourly_io[h_ts] = self.hourly_io.get(h_ts, 0) + in_ + out
+        horizon_day = (datetime.fromtimestamp(now).date() - timedelta(days=days)).isoformat()
+        horizon_ts = now - days * 86400
+        self.daily = {k: v for k, v in self.daily.items() if k[0] >= horizon_day}
+        self.session_daily = {k: v for k, v in self.session_daily.items() if k[0] >= horizon_day}
+        self.hourly_io = {k: v for k, v in self.hourly_io.items() if k >= horizon_ts}
+        self.session_meta = {sid: m for sid, m in self.session_meta.items()
+                             if m.get("last_ts", 0) >= horizon_ts}
 
     def save(self):
-        """Atomically persist the index (prunes first to bound size)."""
+        """Atomically persist the index (folds + prunes first to bound size)."""
         self.prune()
         try:
             CACHE_DIR.mkdir(parents=True, exist_ok=True)
             blob = {
                 "version": INDEX_CACHE_VERSION,
                 "files": {str(k): v for k, v in self.files.items()},
-                "events": self.events,
+                "minutes": self.minutes,
+                "daily": self.daily,
+                "session_daily": self.session_daily,
+                "hourly_io": self.hourly_io,
+                "fold_ts": self.fold_ts,
                 "project_names": {str(k): v for k, v in self.project_names.items()},
                 "session_meta": self.session_meta,
                 "errors": self.errors,
@@ -736,7 +812,7 @@ class ClaudeIndex:
                 continue
             ev_tuple, branch, cwd = result
             ts, sid, model, in_, out, cc, cr = ev_tuple
-            self.events.append((ts, project, sid, model, in_, out, cc, cr))
+            self._bucket(ts, sid, model, in_, out, cc, cr)
             sm = self.session_meta.get(sid)
             if sm is None or ts >= sm.get("last_ts", 0):
                 self.session_meta[sid] = {
@@ -786,43 +862,71 @@ class ClaudeIndex:
     # ── aggregations ────────────────────────────────────────────────
 
     def aggregate(self, since: float = None, until: float = None) -> dict:
-        """Sum tokens within window. Returns dict with totals, by_project, by_model, by_session."""
+        """Sum tokens within window. Returns dict with totals, by_project, by_model, by_session.
+
+        Minute buckets give the recent tail at <=60s edge precision; windows
+        reaching past the fold boundary add whole folded DAYS (a rolling 7d
+        window therefore behaves as "the last 7 calendar days" at its far edge —
+        the standard dashboard semantic).
+        """
         z = lambda: dict(in_=0, out=0, cc=0, cr=0, msgs=0)  # noqa: E731
         by_proj = defaultdict(z)
         by_model = defaultdict(z)
         by_session = {}
         totals = z()
-        for ev in self.events:
-            ts = ev[self.TS]
-            if since is not None and ts < since:
+
+        def add(bucket, in_, out, cc, cr, msgs):
+            bucket["in_"] += in_
+            bucket["out"] += out
+            bucket["cc"] += cc
+            bucket["cr"] += cr
+            bucket["msgs"] += msgs
+
+        for (m_ts, sid, model), (in_, out, cc, cr, msgs) in self.minutes.items():
+            if since is not None and m_ts < since - 59:
                 continue
-            if until is not None and ts > until:
+            if until is not None and m_ts > until:
                 continue
-            proj = ev[self.PROJECT]
-            sid = ev[self.SID]
-            model = ev[self.MODEL]
-            in_, out, cc, cr = ev[self.IN], ev[self.OUT], ev[self.CC], ev[self.CR]
+            proj = self._session_project(sid)
             for bucket in (by_proj[proj], by_model[model], totals):
-                bucket["in_"] += in_
-                bucket["out"] += out
-                bucket["cc"] += cc
-                bucket["cr"] += cr
-                bucket["msgs"] += 1
+                add(bucket, in_, out, cc, cr, msgs)
             s = by_session.get(sid)
             if s is None:
                 s = dict(in_=0, out=0, cc=0, cr=0, msgs=0,
-                         project=proj, model=model, first=ts, last=ts)
+                         project=proj, model=model, first=m_ts, last=m_ts)
                 by_session[sid] = s
-            s["in_"] += in_
-            s["out"] += out
-            s["cc"] += cc
-            s["cr"] += cr
-            s["msgs"] += 1
-            s["model"] = model  # keep last model used
-            if ts > s["last"]:
-                s["last"] = ts
-            if ts < s["first"]:
-                s["first"] = ts
+            add(s, in_, out, cc, cr, msgs)
+            if m_ts > s["last"]:
+                s["last"] = m_ts
+                s["model"] = model  # keep last model used
+            if m_ts < s["first"]:
+                s["first"] = m_ts
+
+        if since is not None and since < self.fold_ts and self.daily:
+            since_day = datetime.fromtimestamp(since).date().isoformat()
+            until_day = (datetime.fromtimestamp(until).date().isoformat()
+                         if until is not None else "9999-12-31")
+            for (day, proj, model), (in_, out, cc, cr, msgs) in self.daily.items():
+                if day < since_day or day > until_day:
+                    continue
+                for bucket in (by_proj[proj], by_model[model], totals):
+                    add(bucket, in_, out, cc, cr, msgs)
+            for (day, sid), (in_, out, cc, cr, msgs) in self.session_daily.items():
+                if day < since_day or day > until_day:
+                    continue
+                day_start = datetime.fromisoformat(day).timestamp()
+                meta = self.session_meta.get(sid, {})
+                s = by_session.get(sid)
+                if s is None:
+                    s = dict(in_=0, out=0, cc=0, cr=0, msgs=0,
+                             project=meta.get("project", "?"),
+                             model=meta.get("model", "?"),
+                             first=day_start, last=day_start + 86399)
+                    by_session[sid] = s
+                add(s, in_, out, cc, cr, msgs)
+                if day_start < s["first"]:
+                    s["first"] = day_start
+
         return {
             "totals": totals,
             "by_project": dict(by_proj),
@@ -834,15 +938,28 @@ class ClaudeIndex:
         """Returns [(date, total_tokens), …] oldest → newest, len == days."""
         today = datetime.now().date()
         buckets = {today - timedelta(days=i): 0 for i in range(days)}
-        for ev in self.events:
-            d = datetime.fromtimestamp(ev[self.TS]).date()
+        for (day, _proj, _model), (in_, out, cc, cr, _msgs) in self.daily.items():
+            d = datetime.fromisoformat(day).date()
             if d in buckets:
-                buckets[d] += ev[self.IN] + ev[self.OUT] + ev[self.CC] + ev[self.CR]
+                buckets[d] += in_ + out + cc + cr
+        for (m_ts, _sid, _model), (in_, out, cc, cr, _msgs) in self.minutes.items():
+            d = datetime.fromtimestamp(m_ts).date()
+            if d in buckets:
+                buckets[d] += in_ + out + cc + cr
         return sorted(buckets.items())
 
     def session_events(self, sid: str) -> list:
-        """All events for a session, oldest-first."""
-        evs = [e for e in self.events if e[self.SID] == sid]
+        """The session's recent activity, oldest-first — one tuple per MINUTE
+        bucket (same tuple shape the renderer always consumed). Sessions whose
+        activity has folded past the minute tail show only their recent part;
+        the live-tail view is for sessions that are, in fact, live.
+        """
+        proj = self._session_project(sid)
+        evs = [
+            (m_ts, proj, sid, model, v[0], v[1], v[2], v[3])
+            for (m_ts, s, model), v in self.minutes.items()
+            if s == sid
+        ]
         evs.sort(key=lambda e: e[self.TS])
         return evs
 
@@ -850,37 +967,34 @@ class ClaudeIndex:
         """Tokens (in+out) per minute over the last lookback_seconds."""
         cutoff = now - lookback_seconds
         total = 0
-        for ev in self.events:
-            if ev[self.TS] >= cutoff:
-                total += ev[self.IN] + ev[self.OUT]
+        for (m_ts, _sid, _model), v in self.minutes.items():
+            if m_ts >= cutoff - 59:
+                total += v[0] + v[1]
         return total / (lookback_seconds / 60) if lookback_seconds > 0 else 0
 
     def hourly_peaks(self, now_ts: float, hours: int = 24) -> list:
         """For each of the last `hours` hours, return the *peak* tokens-per-minute
         (input and output, separately) observed within that hour.
 
-        Same metric Anthropic's Console shows on the rate-limit charts. Computed
-        from the same `usage` numbers Anthropic returned for each request — just
-        bucketed locally.
+        Same metric Anthropic's Console shows on the rate-limit charts —
+        computed straight from the minute buckets (24h < MINUTE_TAIL_HOURS, so
+        the whole chart lives at native resolution).
 
         Returns: [{"hour_ts": epoch, "max_in": int, "max_out": int}, …]
                  oldest first, length == hours.
         """
         end_hour = int(now_ts // 3600) * 3600
         start_hour = end_hour - (hours - 1) * 3600
-        # (hour_idx, minute_idx) -> [in_sum, out_sum]
+        # minute_ts -> [in_sum, out_sum] (summed across sessions/models)
         by_minute: dict = defaultdict(lambda: [0, 0])
-        for ev in self.events:
-            ts = ev[self.TS]
-            if ts < start_hour or ts >= end_hour + 3600:
-                continue
-            hour_idx = int((ts - start_hour) // 3600)
-            minute_idx = int(ts // 60)
-            by_minute[(hour_idx, minute_idx)][0] += ev[self.IN]
-            by_minute[(hour_idx, minute_idx)][1] += ev[self.OUT]
+        for (m_ts, _sid, _model), v in self.minutes.items():
+            if start_hour <= m_ts < end_hour + 3600:
+                by_minute[m_ts][0] += v[0]
+                by_minute[m_ts][1] += v[1]
         peaks = [{"hour_ts": start_hour + h * 3600, "max_in": 0, "max_out": 0}
                  for h in range(hours)]
-        for (hi, _mi), (mi_in, mi_out) in by_minute.items():
+        for m_ts, (mi_in, mi_out) in by_minute.items():
+            hi = int((m_ts - start_hour) // 3600)
             if 0 <= hi < hours:
                 if mi_in > peaks[hi]["max_in"]:
                     peaks[hi]["max_in"] = mi_in
@@ -888,35 +1002,26 @@ class ClaudeIndex:
                     peaks[hi]["max_out"] = mi_out
         return peaks
 
-    def historic_max_5h(self, now: float, days: int = EVENT_RETENTION_DAYS) -> tuple:
-        """Sliding 5h window over last `days` days. Returns (max_in_out_tokens, end_ts).
-        end_ts is the epoch second at which the busiest window ended.
-        Excludes the currently-open 5h window (last 5h before `now`) so the bar
-        compares now vs. *previous* peaks, not now vs. itself.
+    def historic_max_5h(self, now: float, days: int = AGG_RETENTION_DAYS) -> tuple:
+        """Busiest 5h window over the last `days` days, at HOUR grain.
+        Returns (max_in_out_tokens, end_ts). Excludes the currently-open 5h
+        window so the bar compares now vs. *previous* peaks, not now vs. itself.
+        Hour-grain (5 consecutive hour buckets) — a baseline, not an audit.
         """
+        hours: dict = dict(self.hourly_io)
+        for (m_ts, _sid, _model), v in self.minutes.items():
+            h = int(m_ts // 3600) * 3600
+            hours[h] = hours.get(h, 0) + v[0] + v[1]
         cutoff_old = now - days * 86400
-        cutoff_recent = now - 5 * 3600  # exclude current rolling window
-        evs = sorted(
-            (e for e in self.events
-             if cutoff_old <= e[self.TS] <= cutoff_recent),
-            key=lambda e: e[self.TS],
-        )
-        if not evs:
-            return (0, 0)
-        window = 5 * 3600
-        best = 0
-        best_end = 0
-        left = 0
-        running = 0
-        for right, ev_r in enumerate(evs):
-            ts_r = ev_r[self.TS]
-            running += ev_r[self.IN] + ev_r[self.OUT]
-            while left < right and ts_r - evs[left][self.TS] > window:
-                running -= evs[left][self.IN] + evs[left][self.OUT]
-                left += 1
+        last_end = int((now - 5 * 3600) // 3600) * 3600  # newest allowed window END
+        best, best_end = 0, 0
+        for h in hours:
+            end = h + 3600
+            if end > last_end or h < cutoff_old:
+                continue
+            running = sum(hours.get(h - i * 3600, 0) for i in range(5))
             if running > best:
-                best = running
-                best_end = ts_r
+                best, best_end = running, end
         return (best, best_end)
 
 
@@ -1410,18 +1515,21 @@ def tail_log(stdscr, job):
 
 
 def tail_claude_session(stdscr, index: ClaudeIndex, sid: str, project: str):
-    """Live tail one Claude session — each new assistant message renders one row.
+    """Live tail one Claude session — one row per active MINUTE.
 
-    The ClaudeIndex is shared, so periodic refresh() picks up new events
-    appended to the session's JSONL file and we render the deltas.
+    The ClaudeIndex is shared, so periodic refresh() grows the session's
+    minute buckets and we simply re-derive the rows (the scan is tiny in v2);
+    the current minute's row updates in place as tokens accumulate.
     """
     stdscr.timeout(1000)
-    seen = len(index.events)
-    rows = []  # (ts, model, in, out, cc, cr)
-    for ev in index.session_events(sid):
-        rows.append((ev[ClaudeIndex.TS], ev[ClaudeIndex.MODEL],
-                     ev[ClaudeIndex.IN], ev[ClaudeIndex.OUT],
-                     ev[ClaudeIndex.CC], ev[ClaudeIndex.CR]))
+
+    def build_rows():
+        return [(ev[ClaudeIndex.TS], ev[ClaudeIndex.MODEL],
+                 ev[ClaudeIndex.IN], ev[ClaudeIndex.OUT],
+                 ev[ClaudeIndex.CC], ev[ClaudeIndex.CR])
+                for ev in index.session_events(sid)]
+
+    rows = build_rows()
     MAX_ROWS = 1000
     try:
         while True:
@@ -1429,7 +1537,7 @@ def tail_claude_session(stdscr, index: ClaudeIndex, sid: str, project: str):
             h, w = stdscr.getmaxyx()
             safe_addstr(stdscr, 0, 0, f"Session tail — {project}/{sid[:8]}", curses.A_BOLD, w)
             safe_addstr(stdscr, 1, 0,
-                        f"{len(rows)} messages   any key to return", curses.A_DIM, w)
+                        f"{len(rows)} active minutes   any key to return", curses.A_DIM, w)
             header = f"  {'TIME':<8} {'MODEL':<14} {'IN':>8} {'OUT':>8} {'CC':>8} {'CR':>8}"
             safe_addstr(stdscr, 3, 0, header, curses.A_UNDERLINE, w)
 
@@ -1452,16 +1560,9 @@ def tail_claude_session(stdscr, index: ClaudeIndex, sid: str, project: str):
             if ch != -1:
                 break
 
-            # Refresh the index, append new events for this session
-            added = index.refresh()
-            if added:
-                # Only consider events appended since we entered this view
-                for ev in index.events[seen:]:
-                    if ev[ClaudeIndex.SID] == sid:
-                        rows.append((ev[ClaudeIndex.TS], ev[ClaudeIndex.MODEL],
-                                     ev[ClaudeIndex.IN], ev[ClaudeIndex.OUT],
-                                     ev[ClaudeIndex.CC], ev[ClaudeIndex.CR]))
-                seen = len(index.events)
+            # Refresh the index; re-derive this session's minute rows (cheap in v2)
+            if index.refresh():
+                rows = build_rows()
                 if len(rows) > MAX_ROWS:
                     rows = rows[-MAX_ROWS:]
     finally:
@@ -1560,7 +1661,13 @@ def main(stdscr):
     if limits.is_stale():
         limits.fetch_async()  # background; UI shows cached value or "fetching…"
 
-    jobs = collect_jobs()
+    fleet_only = True   # default lens: only YOUR agents (com.hausverwaltung.*), never vendor jobs — 'a' toggles
+
+    def visible_jobs():
+        js = collect_jobs()
+        return [j for j in js if is_fleet_agent(j["label"])] if fleet_only else js
+
+    jobs = visible_jobs()
     sel_l = 0
     scroll_l = 0
     sel_c = 0
@@ -1584,7 +1691,7 @@ def main(stdscr):
         if status_msg and tick > status_msg_until:
             status_msg = ""
         if ch == -1:
-            jobs = collect_jobs()
+            jobs = visible_jobs()
             added = index.refresh()
             if limits.is_stale():
                 limits.fetch_async()
@@ -1594,6 +1701,19 @@ def main(stdscr):
             continue
 
         # Global keys
+        if ch == curses.KEY_RESIZE:
+            # Terminal resized (or a pane split/unsplit): drop the stale frame and
+            # let draw() recompute widths from a fresh getmaxyx on the next tick.
+            stdscr.clear()
+            continue
+        if ch == ord('a'):
+            fleet_only = not fleet_only
+            jobs = visible_jobs()
+            sel_l = 0
+            scroll_l = 0
+            status_msg = "Alle launchd-Agenten" if not fleet_only else "Nur deine Flotte (com.hausverwaltung.*)"
+            status_msg_until = tick + 3
+            continue
         if ch in (ord('q'), ord('Q')):
             index.save()
             break
@@ -1601,7 +1721,7 @@ def main(stdscr):
             focus = "claude" if focus == "launchd" else "launchd"
             continue
         if ch == ord('r'):
-            jobs = collect_jobs()
+            jobs = visible_jobs()
             index.refresh()
             status_msg = "Refreshed"
             status_msg_until = tick + 2
@@ -1638,17 +1758,27 @@ def main(stdscr):
                 if 0 <= sel_l < len(view):
                     status_msg = restart_job(view[sel_l])
                     status_msg_until = tick + 4
-                    jobs = collect_jobs()
+                    jobs = visible_jobs()
             elif ch == ord('s'):
                 view = current_view()
                 if 0 <= sel_l < len(view):
                     status_msg = stop_job(view[sel_l])
                     status_msg_until = tick + 4
-                    jobs = collect_jobs()
-            elif ch in (10, 13):
+                    jobs = visible_jobs()
+            elif ch == ord('l'):
                 view = current_view()
                 if 0 <= sel_l < len(view):
                     tail_log(stdscr, view[sel_l])
+            elif ch in (10, 13):
+                view = current_view()
+                if 0 <= sel_l < len(view):
+                    job = view[sel_l]
+                    if is_fleet_agent(job["label"]):
+                        # the hub move: open Claude Code on THIS agent, seeded to fix it
+                        status_msg = launch_claude_on_agent(job)
+                        status_msg_until = tick + 4
+                    else:
+                        tail_log(stdscr, job)  # vendor job — no Claude prompt, just its log
         else:  # focus == "claude"
             if ch in (curses.KEY_DOWN, ord('j')):
                 sel_c += 1
