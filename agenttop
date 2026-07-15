@@ -401,6 +401,48 @@ HEALTH_LABEL_DE = {
     "unknown": "unbekannt",
 }
 
+# One-sentence purpose per agent for the detail pane — names alone don't say
+# what a job DOES. Two sources: a local overrides file (curated one-liners,
+# stays out of this public repo) and, as the self-maintaining fallback, the
+# first comment line of the agent's own script (the wrappers all carry a
+# "# <name> — what it does." header).
+DESC_OVERRIDES_PATH = Path.home() / ".config" / "agenttop" / "descriptions.json"
+_DESC_CACHE: dict = {"overrides": None, "by_label": {}}
+
+
+def agent_description(job: dict) -> str:
+    if _DESC_CACHE["overrides"] is None:
+        try:
+            _DESC_CACHE["overrides"] = json.loads(DESC_OVERRIDES_PATH.read_text())
+        except (OSError, ValueError):
+            _DESC_CACHE["overrides"] = {}
+    label = job["label"]
+    override = _DESC_CACHE["overrides"].get(label)
+    if override:
+        return override
+    if label in _DESC_CACHE["by_label"]:
+        return _DESC_CACHE["by_label"][label]
+    desc = ""
+    for arg in (job.get("program") or "").split():
+        # only real script files — /bin/zsh, flags and binaries have no header
+        if not (os.path.isfile(arg) and not arg.startswith(("/bin/", "/usr/bin/", "/opt/"))):
+            continue
+        try:
+            with open(arg, errors="ignore") as f:
+                head = f.read(4000).splitlines()[:12]
+        except OSError:
+            continue
+        for ln in head:
+            ln = ln.strip()
+            if ln.startswith("#") and not ln.startswith("#!") and "-*-" not in ln:
+                desc = ln.lstrip("#").strip()
+                break
+        if desc:
+            break
+    _DESC_CACHE["by_label"][label] = desc
+    return desc
+
+
 # launchctl print-disabled is one subprocess for the WHOLE domain — cache it a
 # few ticks instead of paying it once per agent per 2s refresh.
 _DISABLED_CACHE = {"ts": 0.0, "labels": frozenset()}
@@ -1749,6 +1791,9 @@ def draw_agent_detail_pane(stdscr, x0, y0, w, h, job):
     y = wrapped(y, "Ursache", health["symptom"], cpair)
     if health["fix"]:
         y = wrapped(y, "Fix", health["fix"], curses.color_pair(3))
+    desc = agent_description(job)
+    if desc:
+        y = wrapped(y, "Zweck", desc, curses.A_DIM, max_lines=2)
 
     # log tail fills the rest, minus the action bar
     tail_top = y + 1
