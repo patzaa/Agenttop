@@ -160,7 +160,7 @@ Without herdr, ↵ falls back gracefully (herdr is optional for everything else)
 
 ## The fleet it watches
 
-The actual background agents running on this machine (OpenClaw upgrade validation, release-notes review, security/UI watch, deploy validation, audits, worktree cleanup) live in [`patzaa/hausverwaltung-agents`](https://github.com/patzaa/hausverwaltung-agents) — scripts, launchd plists, shared libraries, and the clickable-notification helpers, with a README describing every agent and its schedule.
+The actual background agents running on this machine (upgrade validation, release-notes review, security/UI watch, deploy validation, audits, worktree cleanup) live in [`patzaa/hausverwaltung-agents`](https://github.com/patzaa/hausverwaltung-agents) — scripts, launchd plists, shared libraries, and the clickable-notification helpers, with a README describing every agent and its schedule.
 
 ---
 
