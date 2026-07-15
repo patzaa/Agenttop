@@ -148,6 +148,21 @@ Both are caches — safe to delete; agenttop regenerates them.
 
 ---
 
+## herdr integration — jump from dashboard into a live session
+
+agenttop doesn't just *show* you a failing agent — it gets you into a working session on it. With [herdr](https://github.com/patzaa/herdr) (terminal workspace manager) installed, agenttop can **automatically launch new terminals**:
+
+- **↵ on any agent in the fleet pane** opens a fresh herdr workspace running a **Claude Code session pre-seeded to investigate and improve exactly that agent** — its script, its plist, its log. No copy-pasting paths; you land in a session that already has the context.
+- The agent fleet itself closes the loop from the other side: when a background agent fails or needs input, it posts a **clickable macOS notification** — clicking it opens a herdr pane with a seeded Claude Code session in the affected directory. Dashboard or notification, either way you're one keypress/click from a contextualized session.
+
+Without herdr, ↵ falls back gracefully (herdr is optional for everything else).
+
+## The fleet it watches
+
+The actual background agents running on this machine (OpenClaw upgrade validation, release-notes review, security/UI watch, deploy validation, audits, worktree cleanup) live in [`patzaa/hausverwaltung-agents`](https://github.com/patzaa/hausverwaltung-agents) — scripts, launchd plists, shared libraries, and the clickable-notification helpers, with a README describing every agent and its schedule.
+
+---
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
