@@ -35,6 +35,7 @@ import json
 import os
 import pickle
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -344,6 +345,126 @@ def stop_job(job):
         return f"Sent SIGTERM to {job['label']}"
     err = (r.stderr or r.stdout).strip().splitlines()[-1] if (r.stderr or r.stdout) else "unknown error"
     return f"Stop failed: {err}"
+
+
+# ── Fleet layer — YOUR agents, their health, and one-key "fix with Claude" ──
+#
+# agenttop's launchd pane lists everything; the Fleet layer is the opinionated
+# lens for the agents YOU built (com.hausverwaltung.*, plus your own custom
+# prefixes) — never Microsoft/Slack/Adobe/vendor jobs. It ports the Observer's
+# health model (a silent skip exits 0, so LastExitStatus lies — read the log tail
+# and classify the skip REASON) and its per-symptom fix hint, and adds the thing
+# that makes agenttop a hub: select an agent, press Enter, and Claude Code opens
+# in a fresh herdr workspace already seeded to investigate+improve THAT agent.
+
+FLEET_PREFIXES = ("com.hausverwaltung.",)  # extend with your own label prefixes
+
+# Health states, most-severe first (drives sort + colour).
+HEALTH_ORDER = ("failing", "blocked", "dead", "stale", "recovering", "transient", "healthy", "unknown")
+HEALTH_ICON = {
+    "failing": "🔴", "blocked": "🟠", "dead": "⚫", "stale": "🟡",
+    "recovering": "🟢", "transient": "🔵", "healthy": "✅", "unknown": "◽",
+}
+HEALTH_COLOR = {  # curses colour-pair ids defined in main()
+    "failing": 2, "blocked": 3, "dead": 2, "stale": 3,
+    "recovering": 1, "transient": 5, "healthy": 1, "unknown": 4,
+}
+
+
+def is_fleet_agent(label: str) -> bool:
+    return any(label.startswith(p) for p in FLEET_PREFIXES)
+
+
+def _blocking_skip(text: str) -> bool:
+    return bool(re.search(r"uncommitted|dirty|not a git|no such|command not found|missing|permission denied|cannot", text, re.I))
+
+
+def fix_hint(symptom: str) -> str:
+    s = symptom.lower()
+    if "claude exited" in s or "infra failure" in s or ("error" in s and "claude" in s):
+        return "Anthropic-Guthaben/Key + Gateway prüfen; Agent manuell laufen lassen für die verschluckte Fehlermeldung"
+    if "uncommitted" in s or "dirty" in s:
+        return "Haupt-Checkout aufräumen: untrackte/geänderte Dateien committen oder ignorieren"
+    if "not loaded" in s:
+        return "launchctl bootstrap gui/$(id -u) <plist>"
+    if "no run in" in s or "no run" in s:
+        return "plist-Zeitplan prüfen; lief der Mac zur geplanten Zeit? (verpasste Jobs laufen erst beim Aufwachen)"
+    if "unreachable" in s or "network" in s:
+        return "transient (kein Netz zur Cron-Zeit) — klärt sich beim nächsten Lauf"
+    if "command not found" in s or "missing" in s:
+        return "fehlendes Binary im PATH des Wrappers — installieren oder PATH-Zeile ergänzen"
+    return "Log-Tail lesen und den letzten fehlgeschlagenen Schritt diagnostizieren"
+
+
+def _log_tail(path: str, n: int = 60) -> list:
+    if not path:
+        return []
+    try:
+        with open(path, "r", errors="ignore") as f:
+            return f.read().splitlines()[-n:]
+    except OSError:
+        return []
+
+
+def agent_health(job: dict) -> dict:
+    """Classify one fleet agent: {state, symptom, fix}. A silent skip exits 0, so
+    trust the log tail's most-recent outcome over LastExitStatus."""
+    if job["pid"] == "-" and job["exit"] == "-" and not job.get("log_path"):
+        return {"state": "unknown", "symptom": "no launchctl/log signal", "fix": fix_hint("")}
+    tail = _log_tail(job.get("log_path"))
+    outcome = ""
+    for line in reversed(tail):
+        if re.search(r"Skipped:|Run complete|Digest complete|complete:|ERROR|FAIL|advanced|exit=|Observer complete", line, re.I):
+            outcome = line.strip()
+            break
+    if re.search(r"ERROR|FAIL|exit=[1-9]", outcome):
+        return {"state": "failing", "symptom": outcome, "fix": fix_hint(outcome)}
+    if re.search(r"Skipped:", outcome, re.I):
+        reason = outcome.split("Skipped:", 1)[-1].strip()
+        if _blocking_skip(reason):
+            # dirty-tree skip: the log is stale — is the named repo clean NOW?
+            m = re.search(r"(/[^ ]+) has uncommitted", reason)
+            if m and os.path.isdir(os.path.join(m.group(1), ".git")):
+                clean = subprocess.run(["git", "-C", m.group(1), "status", "--porcelain"],
+                                       capture_output=True, text=True).stdout.strip() == ""
+                if clean:
+                    return {"state": "recovering", "symptom": "letzter Lauf blockiert (dirty tree), Baum jetzt sauber", "fix": "nichts — klärt sich beim nächsten Lauf"}
+            return {"state": "blocked", "symptom": reason, "fix": fix_hint(reason)}
+        return {"state": "transient", "symptom": reason, "fix": fix_hint(reason)}
+    if outcome:
+        return {"state": "healthy", "symptom": outcome, "fix": ""}
+    return {"state": "healthy", "symptom": "läuft", "fix": ""}
+
+
+def launch_claude_on_agent(job: dict) -> str:
+    """Open a focused herdr workspace with Claude Code seeded to investigate +
+    improve THIS agent. Falls back to opening the log if herdr isn't running, so
+    the action is never a dead end."""
+    label = job["label"]
+    short = label.split(".")[-1]
+    log = job.get("log_path") or ""
+    wrapper = str(Path.home() / ".local" / "bin" / f"hausverwaltung-{label.replace('com.hausverwaltung.','')}.sh")
+    health = agent_health(job)
+    prompt = (
+        f"Du arbeitest an dem launchd-Agenten `{label}`. agenttop hat ihn als '{health['state']}' markiert.\n\n"
+        f"- Wrapper: {wrapper}\n- Log: {log}\n- Symptom: {health['symptom']}\n- Fix-Ansatz: {health['fix']}\n\n"
+        "Aufgabe: Log-Tail + Wrapper lesen, ECHTE Ursache finden (bei 'claude exited 1' den Agenten EINMAL manuell mit sichtbarem Output laufen lassen), "
+        "den Fix anwenden WENN eindeutig sicher, sonst vorschlagen. Am Ende 3 Sätze: Ursache, Fix (getan/vorgeschlagen), läuft der nächste Lauf durch. "
+        "Fass keine anderen Agenten an."
+    )
+    if not shutil.which("herdr"):
+        subprocess.run(["open", log] if log else ["true"])
+        return "herdr fehlt — Log geöffnet"
+    try:
+        ws = subprocess.run(["herdr", "workspace", "create", "--cwd", str(Path.home() / "hausverwaltung"),
+                             "--label", f"🔭 {short}", "--focus"], capture_output=True, text=True, timeout=15)
+        wsid = json.loads(ws.stdout)["result"]["workspace"]["workspace_id"]
+        subprocess.Popen(["herdr", "agent", "start", "claude", "--workspace", wsid, "--focus",
+                          "--", "claude", prompt])
+        return f"Claude öffnet für {short} …"
+    except (subprocess.SubprocessError, KeyError, ValueError, json.JSONDecodeError) as e:
+        subprocess.run(["open", log] if log else ["true"])
+        return f"herdr-Start fehlgeschlagen ({type(e).__name__}) — Log geöffnet"
 
 
 # ── Claude data layer ───────────────────────────────────────────────
