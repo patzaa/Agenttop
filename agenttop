@@ -317,6 +317,7 @@ def collect_jobs():
                 "log_path": plist.get("StandardOutPath") or plist.get("StandardErrorPath"),
                 "stderr_path": plist.get("StandardErrorPath"),
                 "program": " ".join(plist.get("ProgramArguments", [])) or plist.get("Program", ""),
+                "workdir": plist.get("WorkingDirectory", ""),
                 "plist_path": str(p),
                 "location": loc.name,
                 "is_daemon": is_daemon,
@@ -476,37 +477,77 @@ def agent_health(job: dict) -> dict:
 
 
 def launch_claude_on_agent(job: dict) -> str:
-    """Open a focused herdr workspace with Claude Code seeded to investigate +
-    improve THIS agent. Falls back to opening the log if herdr isn't running, so
-    the action is never a dead end."""
+    """Open a focused herdr workspace with a FRESH Claude Code session, seeded
+    with everything it needs (plist, program, symptom, fix approach AND the last
+    log lines inline) so it can go straight to solving — no warm-up tool calls.
+
+    Hard lessons baked in (2026-07-15, live failure): the session name must be
+    UNIQUE (a fixed name collides with any other running claude → agent_name_taken
+    and an empty workspace), herdr's output must be CAPTURED (Popen inheriting
+    stdout bleeds error-JSON over the curses screen), and a failed start must be
+    said out loud + cleaned up — never report 'öffnet …' for a spawn that died.
+    """
     label = job["label"]
     short = label.split(".")[-1]
     log = job.get("log_path") or ""
-    # From the plist, not guessed from the label — com.houseclaw.* / com.dan.*
-    # agents don't follow the hausverwaltung-<short>.sh naming.
     program = job.get("program") or "?"
     health = agent_health(job)
+    tail_lines = _log_tail(log, 30)
+    tail_txt = "\n".join(ln[:300] for ln in tail_lines)[-4000:] or "<Log leer>"
     prompt = (
         f"Du arbeitest an dem launchd-Agenten `{label}`. agenttop hat ihn als '{health['state']}' markiert.\n\n"
         f"- Programm: {program}\n- plist: {job.get('plist_path', '?')}\n- Log: {log}\n"
         f"- Symptom: {health['symptom']}\n- Fix-Ansatz: {health['fix']}\n\n"
-        "Aufgabe: Log-Tail + das Programm-Skript lesen, ECHTE Ursache finden (bei 'claude exited 1' den Agenten EINMAL manuell mit sichtbarem Output laufen lassen), "
-        "den Fix anwenden WENN eindeutig sicher, sonst vorschlagen. Am Ende 3 Sätze: Ursache, Fix (getan/vorgeschlagen), läuft der nächste Lauf durch. "
+        f"Die letzten Log-Zeilen (frisch beim Öffnen dieser Session):\n```\n{tail_txt}\n```\n\n"
+        "Aufgabe: ECHTE Ursache finden — Programm-Skript lesen, bei Bedarf mehr Log; bei 'claude exited 1' den Agenten EINMAL manuell mit sichtbarem Output laufen lassen. "
+        "Den Fix anwenden WENN eindeutig sicher, sonst vorschlagen. Am Ende 3 Sätze: Ursache, Fix (getan/vorgeschlagen), läuft der nächste geplante Lauf durch. "
         "Fass keine anderen Agenten an."
     )
+
+    def fallback(reason: str) -> str:
+        if log:
+            subprocess.run(["open", log], capture_output=True)
+            return f"{reason} — Log geöffnet"
+        return reason
+
     if not shutil.which("herdr"):
-        subprocess.run(["open", log] if log else ["true"])
-        return "herdr fehlt — Log geöffnet"
+        return fallback("herdr fehlt")
+
+    def herdr_error(out: str) -> str:
+        try:
+            return json.loads(out).get("error", {}).get("code", "")
+        except (ValueError, AttributeError):
+            return ""
+
+    # cwd: the agent's own WorkingDirectory wins; hausverwaltung agents get the
+    # repo (CLAUDE.md-Kontext); everything else starts at home.
+    workdir = job.get("workdir") or (
+        str(Path.home() / "hausverwaltung") if label.startswith("com.hausverwaltung.")
+        else str(Path.home()))
+    # Unique per press — every Enter is a FRESH session by design.
+    name = f"fix-{short}-{time.strftime('%H%M%S')}"
+    wsid = ""
     try:
-        ws = subprocess.run(["herdr", "workspace", "create", "--cwd", str(Path.home() / "hausverwaltung"),
-                             "--label", f"🔭 {short}", "--focus"], capture_output=True, text=True, timeout=15)
+        ws = subprocess.run(["herdr", "workspace", "create", "--cwd", workdir,
+                             "--label", f"🔭 {short}", "--focus"],
+                            capture_output=True, text=True, timeout=15)
+        err = herdr_error(ws.stdout)
+        if ws.returncode != 0 or err:
+            return fallback(f"herdr workspace: {err or 'exit ' + str(ws.returncode)}")
         wsid = json.loads(ws.stdout)["result"]["workspace"]["workspace_id"]
-        subprocess.Popen(["herdr", "agent", "start", "claude", "--workspace", wsid, "--focus",
-                          "--", "claude", prompt])
-        return f"Claude öffnet für {short} …"
+        start = subprocess.run(["herdr", "agent", "start", name, "--workspace", wsid,
+                                "--focus", "--", "claude", prompt],
+                               capture_output=True, text=True, timeout=20)
+        err = herdr_error(start.stdout)
+        if start.returncode != 0 or err:
+            # never leave an empty shell behind
+            subprocess.run(["herdr", "workspace", "close", wsid], capture_output=True, timeout=10)
+            return fallback(f"herdr start: {err or 'exit ' + str(start.returncode)}")
+        return f"Claude ({name}) öffnet für {short} …"
     except (subprocess.SubprocessError, KeyError, ValueError, json.JSONDecodeError) as e:
-        subprocess.run(["open", log] if log else ["true"])
-        return f"herdr-Start fehlgeschlagen ({type(e).__name__}) — Log geöffnet"
+        if wsid:
+            subprocess.run(["herdr", "workspace", "close", wsid], capture_output=True, timeout=10)
+        return fallback(f"herdr-Start fehlgeschlagen ({type(e).__name__})")
 
 
 # ── Claude data layer ───────────────────────────────────────────────
