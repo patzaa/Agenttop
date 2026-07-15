@@ -1215,8 +1215,11 @@ def draw_launchd_pane(stdscr, x0, y0, w, h, all_jobs, selected, scroll,
         if j["color"] == 4:
             color_attr |= curses.A_DIM
 
+        # Fleet mode sets "display" (label minus the com.hausverwaltung./… prefix)
+        # — the prefix is noise in the list; the full label lives in the detail pane.
+        shown = j.get("display") or j["label"]
         if compact:
-            label = j["label"][:29]
+            label = shown[:29]
             schedule = j["schedule"][:13]
             pid = j["pid"][:5]
             status_text = j["status_text"][:9]
@@ -1224,7 +1227,7 @@ def draw_launchd_pane(stdscr, x0, y0, w, h, all_jobs, selected, scroll,
             row = f" {j['icon']}  {label:<29} {schedule:<14} {pid:<6} {status_text:<10} {log_str:>6}"
             safe_addstr(stdscr, y, x0, row.ljust(w), sel_attr | color_attr, x0 + w)
         else:
-            label = j["label"][:47]
+            label = shown[:47]
             schedule = j["schedule"][:19]
             pid = j["pid"][:6]
             status_text = j["status_text"][:10]
@@ -1766,7 +1769,7 @@ def draw(stdscr, jobs, sel_l, scroll_l, filter_str,
         )
         for y in range(body_top, body_top + body_h):
             safe_addstr(stdscr, y, launchd_w, "│", curses.A_DIM, w)
-        if fleet_only and _filtered:
+        if fleet_only and _filtered and focus == "launchd":
             sel_safe = min(sel_l, len(_filtered) - 1)
             draw_agent_detail_pane(
                 stdscr, launchd_w + 1, body_top, claude_w, body_h,
@@ -1789,7 +1792,9 @@ def draw(stdscr, jobs, sel_l, scroll_l, filter_str,
                     f"filter: /{filter_str}    (c to clear)", curses.A_DIM, w)
     else:
         if fleet_only:
-            hint = "j/k wählen  ↵ Fix mit Claude  l Log  R restart  a alle Jobs  / filter  q quit"
+            hint = ("[tokens]  v window  Enter session tail  Tab zurück zum Detail"
+                    if focus == "claude"
+                    else "j/k wählen  ↵ Fix mit Claude  Tab Tokens  l Log  R restart  a alle  / filter  q")
         else:
             hint = ("[launchd] / filter  R restart  s stop  l/Enter tail  a Flotte"
                     if focus == "launchd"
@@ -1853,6 +1858,13 @@ def main(stdscr):
             j["icon"] = HEALTH_ICON[h_["state"]]
             j["color"] = HEALTH_COLOR[h_["state"]]
             j["status_text"] = h_["state"]
+            # list shows the bare agent name; the prefix is noise here
+            d = j["label"]
+            for pfx in FLEET_PREFIXES:
+                if d.startswith(pfx):
+                    d = d[len(pfx):]
+                    break
+            j["display"] = d
         # worst first — the thing that needs you is always at the top
         js.sort(key=lambda j: (HEALTH_ORDER.index(j["health"]["state"]), j["label"]))
         return js
@@ -1933,12 +1945,8 @@ def main(stdscr):
             index.save()
             break
         if ch == 9:  # Tab
-            if fleet_only:
-                # fleet mode has no second focusable pane (the right side IS the
-                # selected agent) — the full claude pane lives behind 'a'
-                status_msg = "Claude-Pane: erst 'a' (alle Jobs), dann Tab"
-                status_msg_until = tick + 3
-                continue
+            # Fleet mode: Tab flips the RIGHT pane between agent detail and the
+            # full Claude/token view — one key straight to the token usage.
             focus = "claude" if focus == "launchd" else "launchd"
             continue
         if ch == ord('r'):
